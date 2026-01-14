@@ -3,7 +3,6 @@ import re
 import time
 import asyncio
 import aiohttp
-import humanize
 from urllib.parse import urlparse, unquote
 
 from pyrogram import Client, filters
@@ -15,8 +14,10 @@ USER_URL = {}
 USER_TASKS = {}
 USER_CANCEL = set()
 
+
 def is_url(text: str):
     return text.startswith("http://") or text.startswith("https://")
+
 
 def safe_filename(name: str):
     name = re.sub(r"[\\/:*?\"<>|]", "_", name)
@@ -25,34 +26,84 @@ def safe_filename(name: str):
         name = f"file_{int(time.time())}"
     return name[:180]
 
+
+# ✅ time format like screenshot
 def format_time(seconds: float):
     if seconds <= 0:
         return "0s"
-    m, s = divmod(int(seconds), 60)
+    seconds = int(seconds)
+
+    m, s = divmod(seconds, 60)
     h, m = divmod(m, 60)
+
     if h:
-        return f"{h}h {m}m"
+        return f"{h}h, {m}m"
     if m:
-        return f"{m}m {s}s"
+        return f"{m}m, {s}s"
     return f"{s}s"
 
-def make_progress_text(title, downloaded, total, speed, eta):
-    percent = (downloaded / total * 100) if total else 0
-    bar_len = 18
-    filled = int(bar_len * percent / 100) if total else 0
-    bar = "█" * filled + "░" * (bar_len - filled)
 
-    d_str = humanize.naturalsize(downloaded, binary=True)
-    t_str = humanize.naturalsize(total, binary=True) if total else "Unknown"
-    s_str = humanize.naturalsize(speed, binary=True) + "/s" if speed else "0 B/s"
+# ✅ Color flow bar
+def make_circle_bar(percent: float, slots: int = 14):
+    """
+    0%      -> ⚪
+    1-33%   -> 🔴
+    34-66%  -> 🟠
+    67-99%  -> 🟡
+    100%    -> 🟢
+    """
+    if percent < 0:
+        percent = 0
+    if percent > 100:
+        percent = 100
+
+    filled = int((percent / 100) * slots)
+
+    if percent <= 0:
+        fill_icon = "⚪"
+    elif percent < 34:
+        fill_icon = "🔴"
+    elif percent < 67:
+        fill_icon = "🟠"
+    elif percent < 100:
+        fill_icon = "🟡"
+    else:
+        fill_icon = "🟢"
+
+    bar = fill_icon * filled + "⚪" * (slots - filled)
+    return f"[{bar}\n⚪⚪]"
+
+
+# ✅ Screenshot style progress
+def make_progress_text(title, done, total, speed, eta):
+    percent = (done / total * 100) if total else 0
+
+    bar = make_circle_bar(percent)
+
+    done_str = f"{percent:.2f}%"
+
+    done_mib = done / (1024 * 1024)
+    total_mib = (total / (1024 * 1024)) if total else 0
+
+    if total:
+        size_str = f"{done_mib:.1f} MiB of {total_mib:.2f} MiB"
+    else:
+        size_str = f"{done_mib:.1f} MiB of Unknown"
+
+    speed_mib = (speed / (1024 * 1024)) if speed else 0
+    speed_str = f"{speed_mib:.2f} MiB/s"
+
+    eta_str = format_time(eta)
 
     return (
-        f"{title}\n\n"
-        f"`{bar}`  **{percent:.1f}%**\n"
-        f"📦 {d_str} / {t_str}\n"
-        f"⚡ {s_str}\n"
-        f"⏳ ETA: {format_time(eta)}"
+        f"🚀 {title} ⚡\n\n"
+        f"{bar}\n\n"
+        f"⌛ Done: {done_str}\n"
+        f"🖇️ Size: {size_str}\n"
+        f"🚀 Speed: {speed_str}\n"
+        f"⏱ ETA: {eta_str}"
     )
+
 
 async def get_filename_and_size(url: str):
     filename = None
@@ -75,12 +126,14 @@ async def get_filename_and_size(url: str):
                     cd = r.headers.get("Content-Disposition", "")
                     if "filename=" in cd:
                         filename = cd.split("filename=")[-1].strip().strip('"').strip("'")
+
                     if not filename:
                         p = urlparse(str(r.url))
                         base = os.path.basename(p.path)
                         base = unquote(base)
                         if base:
                             filename = base
+
                     if not total and r.headers.get("Content-Length"):
                         total = int(r.headers.get("Content-Length"))
     except:
@@ -91,9 +144,11 @@ async def get_filename_and_size(url: str):
 
     return safe_filename(filename), total
 
+
 async def download_stream(url, file_path, status_msg, uid):
     USER_CANCEL.discard(uid)
     timeout = aiohttp.ClientTimeout(total=None)
+
     downloaded = 0
     start_time = time.time()
     last_edit = 0
@@ -113,8 +168,10 @@ async def download_stream(url, file_path, status_msg, uid):
                 async for chunk in r.content.iter_chunked(1024 * 256):
                     if uid in USER_CANCEL:
                         raise asyncio.CancelledError
+
                     if not chunk:
                         continue
+
                     f.write(chunk)
                     downloaded += len(chunk)
 
@@ -124,15 +181,18 @@ async def download_stream(url, file_path, status_msg, uid):
 
                     if time.time() - last_edit > 2:
                         last_edit = time.time()
+
                         kb = InlineKeyboardMarkup([
                             [InlineKeyboardButton("❌ Cancel Download", callback_data=f"cancel_{uid}")]
                         ])
+
                         await status_msg.edit(
-                            make_progress_text("⬇️ Downloading...", downloaded, total, speed, eta),
+                            make_progress_text("Downloading", downloaded, total, speed, eta),
                             reply_markup=kb
                         )
 
     return downloaded, total
+
 
 async def upload_progress(current, total, status_msg, uid, start_time):
     if uid in USER_CANCEL:
@@ -148,14 +208,18 @@ async def upload_progress(current, total, status_msg, uid, start_time):
 
     if now - status_msg._last_edit > 2:
         status_msg._last_edit = now
+
         kb = InlineKeyboardMarkup([
             [InlineKeyboardButton("❌ Cancel Upload", callback_data=f"cancel_{uid}")]
         ])
+
         await status_msg.edit(
-            make_progress_text("📤 Uploading...", current, total, speed, eta),
+            make_progress_text("Uploading", current, total, speed, eta),
             reply_markup=kb
         )
 
+
+# ✅ Convert to MP4 (Telegram preview friendly)
 async def convert_to_mp4(input_path: str, status_msg, uid):
     if uid in USER_CANCEL:
         raise asyncio.CancelledError
@@ -166,18 +230,21 @@ async def convert_to_mp4(input_path: str, status_msg, uid):
     base = os.path.splitext(input_path)[0]
     out_path = base + "_mp4.mp4"
 
-    await status_msg.edit("🎬 Converting to MP4...\n(FFmpeg running...)")
+    await status_msg.edit("🎬 Converting to MP4...\nPlease wait...")
 
     cmd = [
         "ffmpeg",
         "-y",
         "-i", input_path,
+        "-map", "0:v:0?",
+        "-map", "0:a:0?",
         "-c:v", "libx264",
         "-preset", "veryfast",
         "-crf", "23",
         "-c:a", "aac",
         "-b:a", "128k",
         "-movflags", "+faststart",
+        "-pix_fmt", "yuv420p",
         out_path
     ]
 
@@ -199,10 +266,6 @@ async def convert_to_mp4(input_path: str, status_msg, uid):
             break
 
         await asyncio.sleep(1)
-        try:
-            await status_msg.edit("🎬 Converting to MP4...\nPlease wait...")
-        except:
-            pass
 
     await proc.wait()
 
@@ -211,12 +274,41 @@ async def convert_to_mp4(input_path: str, status_msg, uid):
 
     return out_path
 
+
+# ✅ Generate Thumbnail (preview image)
+async def generate_thumb(video_path: str, uid: int):
+    os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+    thumb_path = os.path.join(DOWNLOAD_DIR, f"{uid}_thumb.jpg")
+
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-ss", "3",
+        "-i", video_path,
+        "-vframes", "1",
+        "-q:v", "2",
+        thumb_path
+    ]
+
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.DEVNULL
+    )
+    await proc.wait()
+
+    if os.path.exists(thumb_path):
+        return thumb_path
+    return None
+
+
 app = Client(
     "UrlUploaderBot",
     bot_token=BOT_TOKEN,
     api_id=API_ID,
     api_hash=API_HASH
 )
+
 
 @app.on_message(filters.private & filters.command("start"))
 async def start_cmd(client, message):
@@ -228,6 +320,7 @@ async def start_cmd(client, message):
         "🎥 Video = Convert MP4 + Video upload\n\n"
         "Cancel supported ✅"
     )
+
 
 @app.on_message(filters.private & filters.text)
 async def url_handler(client, message):
@@ -244,6 +337,7 @@ async def url_handler(client, message):
         ]
     ])
     await message.reply("✅ URL Received!\n\nSelect upload type:", reply_markup=kb)
+
 
 @app.on_callback_query(filters.regex("^cancel_"))
 async def cancel_task(client, cb):
@@ -265,6 +359,7 @@ async def cancel_task(client, cb):
     except:
         pass
 
+
 @app.on_callback_query(filters.regex("^(send_file|send_video)$"))
 async def send_type_selected(client, cb):
     uid = cb.from_user.id
@@ -282,6 +377,8 @@ async def send_type_selected(client, cb):
     async def job():
         file_path = None
         mp4_path = None
+        thumb = None
+
         try:
             filename, _ = await get_filename_and_size(url)
             if "." not in filename:
@@ -312,10 +409,14 @@ async def send_type_selected(client, cb):
             await status.edit("📤 Uploading...", reply_markup=kb)
 
             if mode == "video":
+                thumb = await generate_thumb(upload_path, uid)
+
                 await client.send_video(
                     chat_id=cb.message.chat.id,
                     video=upload_path,
                     caption=f"✅ Uploaded as MP4 Video\n\n📌 {os.path.basename(upload_path)}",
+                    supports_streaming=True,
+                    thumb=thumb,
                     progress=upload_progress,
                     progress_args=(status, uid, up_start)
                 )
@@ -337,13 +438,15 @@ async def send_type_selected(client, cb):
                 await status.edit("❌ Cancelled ✅")
             except:
                 pass
+
         except Exception as e:
             try:
                 await status.edit(f"❌ Failed!\n\nError: `{e}`")
             except:
                 pass
+
         finally:
-            for p in [file_path, mp4_path]:
+            for p in [file_path, mp4_path, thumb]:
                 if p and os.path.exists(p):
                     try:
                         os.remove(p)
@@ -356,6 +459,7 @@ async def send_type_selected(client, cb):
 
     t = asyncio.create_task(job())
     USER_TASKS[uid] = t
+
 
 if __name__ == "__main__":
     if not BOT_TOKEN or not API_ID or not API_HASH:
