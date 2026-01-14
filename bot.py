@@ -21,7 +21,7 @@ USER_CANCEL = set()
 
 LAST_MEDIA = {}  # uid -> {"type": "video"|"file"|"audio", "path": "..."}
 
-MAX_SIZE = 500 * 1024 * 1024  # 500MB limit (safe for render free)
+MAX_SIZE = 500 * 1024 * 1024  # 500MB (safe for render free)
 
 # -------------------------
 # Helpers
@@ -113,26 +113,8 @@ def calc_reduction(old_bytes: int, new_bytes: int):
 
 
 # -------------------------
-# Video Thumb + Meta (FIX)
+# Video Meta + Thumb (FIXED)
 # -------------------------
-async def gen_thumbnail(input_path: str, out_thumb: str):
-    cmd = [
-        "ffmpeg", "-y",
-        "-ss", "00:00:03",
-        "-i", input_path,
-        "-frames:v", "1",
-        "-q:v", "2",
-        out_thumb
-    ]
-    proc = await asyncio.create_subprocess_exec(
-        *cmd,
-        stdout=asyncio.subprocess.DEVNULL,
-        stderr=asyncio.subprocess.DEVNULL
-    )
-    await proc.wait()
-    return os.path.exists(out_thumb)
-
-
 def get_video_meta(path: str):
     """
     duration, width, height from ffprobe
@@ -162,9 +144,38 @@ def get_video_meta(path: str):
         return 0, 0, 0
 
 
-async def send_video_with_meta(client, chat_id, video_path, caption, status_msg=None, uid=None):
+async def gen_thumbnail(input_path: str, out_thumb: str):
     """
-    ✅ Ensures preview image + correct size/duration preview
+    ✅ Thumbnail from middle scene (not starting)
+    """
+    dur, _, _ = get_video_meta(input_path)
+    if dur and dur > 6:
+        ss = dur // 2
+    else:
+        ss = 3
+
+    cmd = [
+        "ffmpeg", "-y",
+        "-ss", str(ss),
+        "-i", input_path,
+        "-frames:v", "1",
+        "-vf", "scale=640:-1",
+        "-q:v", "2",
+        out_thumb
+    ]
+
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.DEVNULL
+    )
+    await proc.wait()
+    return os.path.exists(out_thumb)
+
+
+async def send_video_with_meta(client, chat_id, video_path, caption):
+    """
+    ✅ Ensures preview image + correct duration/size preview
     """
     thumb_path = os.path.splitext(video_path)[0] + "_thumb.jpg"
     try:
@@ -298,7 +309,6 @@ async def download_stream(url, file_path, status_msg, uid):
             if r.headers.get("Content-Length"):
                 total = int(r.headers["Content-Length"])
 
-            # size limit check
             if total and total > MAX_SIZE:
                 raise Exception("File too large (max 500MB)")
 
@@ -332,7 +342,7 @@ async def download_stream(url, file_path, status_msg, uid):
 
 
 # -------------------------
-# FFmpeg tools (simple/stable)
+# FFmpeg tools (stable)
 # -------------------------
 QUALITY_MAP = {
     "2160": (3840, 2160),
@@ -432,9 +442,7 @@ app = Client(
     api_hash=API_HASH
 )
 
-# -------------------------
-# Start
-# -------------------------
+
 @app.on_message(filters.private & filters.command("start"))
 async def start_cmd(client, message):
     await message.reply(
@@ -447,9 +455,7 @@ async def start_cmd(client, message):
         "❌ Cancel supported ✅"
     )
 
-# -------------------------
-# Cancel
-# -------------------------
+
 @app.on_callback_query(filters.regex("^cancel_"))
 async def cancel_task(client, cb):
     try:
@@ -469,20 +475,16 @@ async def cancel_task(client, cb):
     except:
         pass
 
-# -------------------------
-# URL handler
-# -------------------------
+
 @app.on_message(filters.private & filters.text)
 async def url_handler(client, message):
     text = message.text.strip()
+    uid = message.from_user.id
 
     if text.startswith("/"):
         return
 
     if is_url(text):
-        uid = message.from_user.id
-
-        # one task per user
         if uid in USER_TASKS and not USER_TASKS[uid].done():
             return await message.reply("⚠️ One process already running. Please wait or cancel.")
 
@@ -497,14 +499,11 @@ async def url_handler(client, message):
 
     return await message.reply("❌ Send a direct URL or send a media file.")
 
-# -------------------------
-# Media received
-# -------------------------
+
 @app.on_message(filters.private & filters.media)
 async def file_received(client, message):
     uid = message.from_user.id
 
-    # one task per user
     if uid in USER_TASKS and not USER_TASKS[uid].done():
         return await message.reply("⚠️ One process already running. Please wait or cancel.")
 
@@ -819,7 +818,7 @@ async def conv_v_mp4(client, cb):
 
 
 # -------------------------
-# URL selection
+# URL Upload Selection
 # -------------------------
 @app.on_callback_query(filters.regex("^(send_file|send_video)$"))
 async def send_type_selected(client, cb):
@@ -827,7 +826,6 @@ async def send_type_selected(client, cb):
     if uid not in USER_URL:
         return await cb.message.edit("❌ Session expired. Send URL again.")
 
-    # one task per user
     if uid in USER_TASKS and not USER_TASKS[uid].done():
         return await cb.message.reply("⚠️ One process already running. Please wait or cancel.")
 
@@ -858,7 +856,6 @@ async def send_type_selected(client, cb):
             upload_path = file_path
 
             if mode == "video":
-                # ensure mp4
                 if not file_path.lower().endswith(".mp4"):
                     mp4_out = os.path.splitext(file_path)[0] + "_mp4.mp4"
                     await status.edit("🎬 Converting to MP4...")
@@ -868,9 +865,6 @@ async def send_type_selected(client, cb):
                     upload_path = mp4_out
 
                 await status.edit("📤 Uploading video...")
-                up_start = time.time()
-                kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel Upload", callback_data=f"cancel_{uid}")]])
-                await status.edit("📤 Uploading...", reply_markup=kb)
 
                 await send_video_with_meta(
                     client,
@@ -878,8 +872,8 @@ async def send_type_selected(client, cb):
                     upload_path,
                     caption=f"✅ Uploaded as MP4 Video\n📌 {os.path.basename(upload_path)}"
                 )
+
             else:
-                await status.edit("📤 Uploading file...")
                 up_start = time.time()
                 kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel Upload", callback_data=f"cancel_{uid}")]])
                 await status.edit("📤 Uploading...", reply_markup=kb)
@@ -914,7 +908,6 @@ async def send_type_selected(client, cb):
             USER_TASKS.pop(uid, None)
             USER_CANCEL.discard(uid)
 
-            # cleanup
             for p in [file_path, mp4_out]:
                 if p and os.path.exists(p):
                     try:
