@@ -182,7 +182,6 @@ async def tg_download_progress(current, total, status_msg, uid, start_time):
     if not hasattr(status_msg, "_last_edit"):
         status_msg._last_edit = 0
 
-    # ✅ Stable: edit every 4 sec
     if now - status_msg._last_edit > 4:
         status_msg._last_edit = now
         kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_{uid}")]])
@@ -349,14 +348,9 @@ async def compress_file_zip(input_path: str, out_zip: str):
 # UI Keyboards
 # -------------------------
 QUALITY_MAP = {
-    "2160": (3840, 2160),
-    "1440": (2560, 1440),
-    "1080": (1920, 1080),
     "720":  (1280, 720),
     "480":  (854, 480),
     "360":  (640, 360),
-    "240":  (426, 240),
-    "144":  (256, 144),
 }
 
 def kb_main_menu():
@@ -438,7 +432,6 @@ async def cancel_task(client, cb):
         return await cb.answer("Invalid", show_alert=True)
 
     USER_CANCEL.add(uid)
-
     task = USER_TASKS.get(uid)
     if task and not task.done():
         task.cancel()
@@ -451,7 +444,7 @@ async def cancel_task(client, cb):
 
 
 # -------------------------
-# Back buttons
+# Main menu back
 # -------------------------
 @app.on_callback_query(filters.regex("^back_main$"))
 async def back_main(client, cb):
@@ -514,11 +507,10 @@ async def media_handler(client, message):
     start = time.time()
 
     async def job():
-        local_path = None
         try:
+            # ✅ FIXED: no block_size here
             local_path = await message.download(
                 file_name=DOWNLOAD_DIR,
-                block_size=1024 * 512,  # ✅ FIX
                 progress=tg_download_progress,
                 progress_args=(status, uid, start)
             )
@@ -546,7 +538,7 @@ async def menu_convert(client, cb):
 
 
 # -------------------------
-# Compressor: Video menu (simple)
+# Compressor: Video menu
 # -------------------------
 @app.on_callback_query(filters.regex("^compress_video_menu$"))
 async def compress_video_menu(client, cb):
@@ -665,151 +657,7 @@ async def compress_file(client, cb):
 
 
 # -------------------------
-# Converter: video->mp3
-# -------------------------
-@app.on_callback_query(filters.regex("^conv_v_mp3$"))
-async def conv_v_mp3(client, cb):
-    uid = cb.from_user.id
-    media = LAST_MEDIA.get(uid)
-    if not media or media["type"] != "video":
-        return await cb.answer("❌ Send video first", show_alert=True)
-
-    if media["size"] > MAX_CONVERT_SIZE:
-        return await cb.answer("❌ Convert max 500MB", show_alert=True)
-
-    in_path = media["path"]
-    out_path = os.path.splitext(in_path)[0] + ".mp3"
-    status = await cb.message.reply("⚙️ Converting Video → Audio (MP3)...")
-
-    async def job():
-        try:
-            dur, _, _ = get_video_meta(in_path)
-            dur = dur or 60
-
-            cmd = ["ffmpeg", "-y", "-i", in_path, "-vn", "-c:a", "libmp3lame", "-b:a", "128k", out_path]
-            rc = await ffmpeg_with_progress(cmd, status, uid, "Converting to MP3", dur)
-            if rc != 0 or not os.path.exists(out_path):
-                raise Exception("MP3 conversion failed")
-
-            await client.send_audio(cb.message.chat.id, out_path, caption="✅ Video → Audio (MP3) 🎵")
-            await status.edit("✅ Completed Successfully 🎉")
-        except Exception as e:
-            await status.edit(f"❌ Failed!\n\nError: `{e}`")
-        finally:
-            clean_file(out_path)
-
-    asyncio.create_task(job())
-
-
-# -------------------------
-# Converter: file->mp4
-# -------------------------
-@app.on_callback_query(filters.regex("^conv_f_mp4$"))
-async def conv_f_mp4(client, cb):
-    uid = cb.from_user.id
-    media = LAST_MEDIA.get(uid)
-    if not media:
-        return await cb.answer("❌ Send file first", show_alert=True)
-
-    if media["size"] > MAX_CONVERT_SIZE:
-        return await cb.answer("❌ Convert max 500MB", show_alert=True)
-
-    in_path = media["path"]
-    out_path = os.path.splitext(in_path)[0] + "_file.mp4"
-    status = await cb.message.reply("⚙️ Converting File → MP4...")
-
-    async def job():
-        try:
-            dur, _, _ = get_video_meta(in_path)
-            dur = dur or 60
-
-            cmd = [
-                "ffmpeg", "-y", "-i", in_path,
-                "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
-                "-c:a", "aac", "-b:a", "128k",
-                "-movflags", "+faststart",
-                out_path
-            ]
-
-            rc = await ffmpeg_with_progress(cmd, status, uid, "Converting File → MP4", dur)
-            if rc != 0 or not os.path.exists(out_path):
-                raise Exception("MP4 conversion failed")
-
-            await send_video_with_meta(client, cb.message.chat.id, out_path, caption="✅ File → MP4 🎬")
-            await status.edit("✅ Completed Successfully 🎉")
-        except Exception as e:
-            await status.edit(f"❌ Failed!\n\nError: `{e}`")
-        finally:
-            clean_file(out_path)
-
-    asyncio.create_task(job())
-
-
-# -------------------------
-# Converter: video->file
-# -------------------------
-@app.on_callback_query(filters.regex("^conv_v_file$"))
-async def conv_v_file(client, cb):
-    uid = cb.from_user.id
-    media = LAST_MEDIA.get(uid)
-    if not media or media["type"] != "video":
-        return await cb.answer("❌ Send video first", show_alert=True)
-
-    if media["size"] > MAX_CONVERT_SIZE:
-        return await cb.answer("❌ Convert max 500MB", show_alert=True)
-
-    await client.send_document(cb.message.chat.id, media["path"], caption="✅ Video → File 📁")
-    await cb.answer("✅ Done")
-
-
-# -------------------------
-# Converter: video->mp4
-# -------------------------
-@app.on_callback_query(filters.regex("^conv_v_mp4$"))
-async def conv_v_mp4(client, cb):
-    uid = cb.from_user.id
-    media = LAST_MEDIA.get(uid)
-    if not media or media["type"] != "video":
-        return await cb.answer("❌ Send video first", show_alert=True)
-
-    if media["size"] > MAX_CONVERT_SIZE:
-        return await cb.answer("❌ Convert max 500MB", show_alert=True)
-
-    in_path = media["path"]
-    if in_path.lower().endswith(".mp4"):
-        return await cb.answer("Already MP4 ✅", show_alert=True)
-
-    out_path = os.path.splitext(in_path)[0] + "_converted.mp4"
-    status = await cb.message.reply("⚙️ Converting Video → MP4...")
-
-    async def job():
-        try:
-            dur, _, _ = get_video_meta(in_path)
-            dur = dur or 60
-
-            cmd = [
-                "ffmpeg", "-y", "-i", in_path,
-                "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
-                "-c:a", "aac", "-b:a", "128k",
-                "-movflags", "+faststart",
-                out_path
-            ]
-            rc = await ffmpeg_with_progress(cmd, status, uid, "Converting to MP4", dur)
-            if rc != 0 or not os.path.exists(out_path):
-                raise Exception("MP4 conversion failed")
-
-            await send_video_with_meta(client, cb.message.chat.id, out_path, caption="✅ Video → MP4 🎬")
-            await status.edit("✅ Completed Successfully 🎉")
-        except Exception as e:
-            await status.edit(f"❌ Failed!\n\nError: `{e}`")
-        finally:
-            clean_file(out_path)
-
-    asyncio.create_task(job())
-
-
-# -------------------------
-# URL Upload Selection
+# URL Upload selection
 # -------------------------
 @app.on_callback_query(filters.regex("^(send_file|send_video)$"))
 async def send_type_selected(client, cb):
@@ -836,7 +684,6 @@ async def send_type_selected(client, cb):
                 filename += ".bin"
 
             file_path = os.path.join(DOWNLOAD_DIR, f"{uid}_{int(time.time())}_{filename}")
-
             await download_stream(url, file_path, status, uid)
 
             if mode == "video":
