@@ -13,15 +13,18 @@ from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from config import BOT_TOKEN, API_ID, API_HASH, DOWNLOAD_DIR
 
 # -------------------------
+# Limits
+# -------------------------
+MAX_URL_SIZE = 2 * 1024 * 1024 * 1024   # ✅ 2GB URL uploader
+MAX_PROC_SIZE = 500 * 1024 * 1024       # ✅ 500MB compress/convert safe limit
+
+# -------------------------
 # Storage
 # -------------------------
 USER_URL = {}
 USER_TASKS = {}
 USER_CANCEL = set()
-
-LAST_MEDIA = {}  # uid -> {"type": "video"|"file"|"audio", "path": "..."}
-
-MAX_SIZE = 500 * 1024 * 1024  # 500MB (safe for render free)
+LAST_MEDIA = {}  # uid -> {"type": "video"|"file"|"audio", "path": "...", "size": int}
 
 # -------------------------
 # Helpers
@@ -113,12 +116,9 @@ def calc_reduction(old_bytes: int, new_bytes: int):
 
 
 # -------------------------
-# Video Meta + Thumb (FIXED)
+# Video Meta + Thumb
 # -------------------------
 def get_video_meta(path: str):
-    """
-    duration, width, height from ffprobe
-    """
     try:
         r = subprocess.run(
             [
@@ -134,25 +134,18 @@ def get_video_meta(path: str):
         )
         data = json.loads(r.stdout)
         stream = data["streams"][0]
-
         width = int(stream.get("width") or 0)
         height = int(stream.get("height") or 0)
         duration = float(stream.get("duration") or 0)
-
         return int(duration), width, height
     except:
         return 0, 0, 0
 
 
 async def gen_thumbnail(input_path: str, out_thumb: str):
-    """
-    ✅ Thumbnail from middle scene (not starting)
-    """
+    # ✅ middle scene thumbnail
     dur, _, _ = get_video_meta(input_path)
-    if dur and dur > 6:
-        ss = dur // 2
-    else:
-        ss = 3
+    ss = dur // 2 if dur and dur > 6 else 3
 
     cmd = [
         "ffmpeg", "-y",
@@ -163,7 +156,6 @@ async def gen_thumbnail(input_path: str, out_thumb: str):
         "-q:v", "2",
         out_thumb
     ]
-
     proc = await asyncio.create_subprocess_exec(
         *cmd,
         stdout=asyncio.subprocess.DEVNULL,
@@ -174,9 +166,6 @@ async def gen_thumbnail(input_path: str, out_thumb: str):
 
 
 async def send_video_with_meta(client, chat_id, video_path, caption):
-    """
-    ✅ Ensures preview image + correct duration/size preview
-    """
     thumb_path = os.path.splitext(video_path)[0] + "_thumb.jpg"
     try:
         await gen_thumbnail(video_path, thumb_path)
@@ -309,8 +298,9 @@ async def download_stream(url, file_path, status_msg, uid):
             if r.headers.get("Content-Length"):
                 total = int(r.headers["Content-Length"])
 
-            if total and total > MAX_SIZE:
-                raise Exception("File too large (max 500MB)")
+            # ✅ URL limit 2GB
+            if total and total > MAX_URL_SIZE:
+                raise Exception("URL file too large (max 2GB)")
 
             os.makedirs(os.path.dirname(file_path), exist_ok=True)
 
@@ -342,7 +332,7 @@ async def download_stream(url, file_path, status_msg, uid):
 
 
 # -------------------------
-# FFmpeg tools (stable)
+# FFmpeg tools
 # -------------------------
 QUALITY_MAP = {
     "2160": (3840, 2160),
@@ -414,22 +404,20 @@ async def video_to_mp3(input_path: str, out_path: str):
     return await run_ffmpeg(cmd)
 
 
-async def mp3_to_mp4(input_path: str, out_path: str):
-    cmd = [
-        "ffmpeg", "-y",
-        "-f", "lavfi",
-        "-i", "color=c=black:s=1280x720:r=30",
-        "-i", input_path,
-        "-shortest",
-        "-c:v", "libx264",
-        "-preset", "veryfast",
-        "-crf", "28",
-        "-c:a", "aac",
-        "-b:a", "128k",
-        "-movflags", "+faststart",
-        out_path
-    ]
-    return await run_ffmpeg(cmd)
+# -------------------------
+# UI Menus
+# -------------------------
+def kb_main_menu():
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("🗜 Compressor", callback_data="menu_compress"),
+            InlineKeyboardButton("👑 Converter", callback_data="menu_convert")
+        ]
+    ])
+
+
+def kb_back(to="back_main"):
+    return InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data=to)]])
 
 
 # -------------------------
@@ -443,19 +431,35 @@ app = Client(
 )
 
 
+# -------------------------
+# Start Message
+# -------------------------
 @app.on_message(filters.private & filters.command("start"))
 async def start_cmd(client, message):
     await message.reply(
-        "✅ **URL Uploader Bot**\n\n"
-        "🌐 Send a direct URL\n"
-        "Then choose:\n"
-        "📁 File = Document\n"
-        "🎥 Video = Convert MP4 + Video upload\n\n"
-        "📌 You can also send any media directly ✅\n"
-        "❌ Cancel supported ✅"
+        "✨ Welcome to Multifunctional Bot! 🤖💫\n"
+        "Here you can do multiple things in one bot 🚀\n\n"
+        "🌐 URL Uploader\n"
+        "➜ Send any direct link and I will upload it for you instantly ✅\n\n"
+        "🗜️ Compressor\n"
+        "➜ Reduce file/video size easily without hassle ⚡\n"
+        "⚠️ Compression Limit: 500MB\n\n"
+        "🎛️ Converter\n"
+        "➜ Convert your files into different formats (mp4 / mp3 / mkv etc.) 🎬🎵\n"
+        "⚠️ Conversion Limit: 500MB\n\n"
+        "📌 How to use?\n"
+        "1️⃣ Send a File / Video / Audio / URL\n"
+        "2️⃣ Select your needed option ✅\n"
+        "3️⃣ Wait for processing ⏳\n"
+        "4️⃣ Get your output 🎉\n\n"
+        "💡 Use /help for all commands & guide 🛠️\n"
+        "🚀 Now send something to start 👇😊"
     )
 
 
+# -------------------------
+# Cancel
+# -------------------------
 @app.on_callback_query(filters.regex("^cancel_"))
 async def cancel_task(client, cb):
     try:
@@ -476,6 +480,9 @@ async def cancel_task(client, cb):
         pass
 
 
+# -------------------------
+# URL handler
+# -------------------------
 @app.on_message(filters.private & filters.text)
 async def url_handler(client, message):
     text = message.text.strip()
@@ -500,6 +507,9 @@ async def url_handler(client, message):
     return await message.reply("❌ Send a direct URL or send a media file.")
 
 
+# -------------------------
+# Telegram media received
+# -------------------------
 @app.on_message(filters.private & filters.media)
 async def file_received(client, message):
     uid = message.from_user.id
@@ -521,16 +531,16 @@ async def file_received(client, message):
     else:
         return await message.reply("❌ Unsupported media type.")
 
-    if size > MAX_SIZE:
+    # ✅ Compressor/Converter safe limit
+    if size > MAX_PROC_SIZE:
         return await message.reply(
-            f"❌ File too large!\n\nMax: 500MB\nYour file: {size/(1024*1024):.2f}MB"
+            f"❌ Processing limit exceeded!\n\nMax: 500MB\nYour file: {size/(1024*1024):.2f}MB"
         )
 
     status = await message.reply("⬇️ Starting Telegram download...")
     start_time = time.time()
 
     async def job():
-        local_path = None
         try:
             local_path = await message.download(
                 file_name=DOWNLOAD_DIR,
@@ -538,15 +548,9 @@ async def file_received(client, message):
                 progress_args=(status, uid, start_time)
             )
 
-            LAST_MEDIA[uid] = {"type": media_type, "path": local_path}
+            LAST_MEDIA[uid] = {"type": media_type, "path": local_path, "size": size}
 
-            kb = InlineKeyboardMarkup([
-                [
-                    InlineKeyboardButton("🗜 Compressor", callback_data="menu_compress"),
-                    InlineKeyboardButton("👑 Converter", callback_data="menu_convert_royal")
-                ]
-            ])
-            await status.edit("✅ Media received.\n👇 Choose option:", reply_markup=kb)
+            await status.edit("✅ Media received.\n👇 Choose option:", reply_markup=kb_main_menu())
 
         except asyncio.CancelledError:
             try:
@@ -564,17 +568,58 @@ async def file_received(client, message):
 
 
 # -------------------------
+# Back buttons
+# -------------------------
+@app.on_callback_query(filters.regex("^back_main$"))
+async def back_main(client, cb):
+    await cb.message.edit("✅ Choose option:", reply_markup=kb_main_menu())
+
+
+@app.on_callback_query(filters.regex("^back_convert$"))
+async def back_convert(client, cb):
+    await cb.message.edit("👑 Converter Menu\n👇 Choose conversion type:", reply_markup=kb_converter_menu())
+
+
+@app.on_callback_query(filters.regex("^back_compress$"))
+async def back_compress(client, cb):
+    await cb.message.edit("🗜 Choose Compression Type:", reply_markup=kb_compress_menu())
+
+
+# -------------------------
 # Menus
 # -------------------------
-@app.on_callback_query(filters.regex("^menu_compress$"))
-async def menu_compress(client, cb):
-    kb = InlineKeyboardMarkup([
+def kb_compress_menu():
+    return InlineKeyboardMarkup([
         [
             InlineKeyboardButton("🟢 Compress Higher", callback_data="compress_high"),
             InlineKeyboardButton("🔴 Compress Lower", callback_data="compress_low")
-        ]
+        ],
+        [InlineKeyboardButton("🔙 Back", callback_data="back_main")]
     ])
-    await cb.message.edit("🗜 Choose Compression Type:", reply_markup=kb)
+
+
+def kb_converter_menu():
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("🎥➡️🎵 Video → Audio", callback_data="conv_v_mp3"),
+            InlineKeyboardButton("📁➡️🎥 File → MP4", callback_data="conv_f_mp4")
+        ],
+        [
+            InlineKeyboardButton("🎥➡️📁 Video → File", callback_data="conv_v_file"),
+            InlineKeyboardButton("🎥➡️🎬 Video → MP4", callback_data="conv_v_mp4")
+        ],
+        [InlineKeyboardButton("🔙 Back", callback_data="back_main")]
+    ])
+
+
+@app.on_callback_query(filters.regex("^menu_compress$"))
+async def menu_compress(client, cb):
+    await cb.message.edit("🗜 Choose Compression Type:", reply_markup=kb_compress_menu())
+
+
+@app.on_callback_query(filters.regex("^menu_convert$"))
+async def menu_convert(client, cb):
+    await cb.message.edit("👑 Converter Menu\n👇 Choose conversion type:", reply_markup=kb_converter_menu())
 
 
 @app.on_callback_query(filters.regex("^compress_high$"))
@@ -589,6 +634,7 @@ async def compress_high(client, cb):
             InlineKeyboardButton("📺 720p", callback_data="q_720"),
             InlineKeyboardButton("📺 480p", callback_data="q_480"),
         ],
+        [InlineKeyboardButton("🔙 Back", callback_data="back_compress")]
     ])
     await cb.message.edit("✨ Select Higher Quality:", reply_markup=kb)
 
@@ -600,24 +646,10 @@ async def compress_low(client, cb):
             InlineKeyboardButton("📉 360p", callback_data="q_360"),
             InlineKeyboardButton("📉 240p", callback_data="q_240"),
             InlineKeyboardButton("📉 144p", callback_data="q_144"),
-        ]
+        ],
+        [InlineKeyboardButton("🔙 Back", callback_data="back_compress")]
     ])
     await cb.message.edit("📉 Select Lower Quality:", reply_markup=kb)
-
-
-@app.on_callback_query(filters.regex("^menu_convert_royal$"))
-async def menu_convert_royal(client, cb):
-    kb = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("🎥➡️🎵 Video → MP3", callback_data="conv_v_mp3"),
-            InlineKeyboardButton("🎧➡️🎬 Audio → Video", callback_data="conv_f_vid")
-        ],
-        [
-            InlineKeyboardButton("🎥➡️📁 Video → File", callback_data="conv_v_file"),
-            InlineKeyboardButton("🎥➡️🎬 Video → MP4", callback_data="conv_v_mp4")
-        ]
-    ])
-    await cb.message.edit("👑 Converter Menu\n👇 Choose conversion type:", reply_markup=kb)
 
 
 # -------------------------
@@ -634,7 +666,7 @@ async def quality_selected(client, cb):
     q = cb.data.split("_", 1)[1]
     in_path = media["path"]
 
-    status = await cb.message.reply("🗜 Preparing compression...")
+    status = await cb.message.reply("🗜 Compressing... Please wait ⏳")
 
     async def job():
         out_path = None
@@ -648,8 +680,6 @@ async def quality_selected(client, cb):
 
             new_size = os.path.getsize(out_path)
             reduced = calc_reduction(old_size, new_size)
-
-            await status.edit("📤 Uploading compressed video...")
 
             await send_video_with_meta(
                 client,
@@ -690,7 +720,7 @@ async def conv_v_mp3(client, cb):
         return await cb.answer("Send a video first.", show_alert=True)
 
     in_path = media["path"]
-    status = await cb.message.reply("🎵 Converting Video → MP3...")
+    status = await cb.message.reply("🎵 Converting Video → Audio (MP3)...")
 
     async def job():
         out_path = None
@@ -703,7 +733,7 @@ async def conv_v_mp3(client, cb):
             await client.send_audio(
                 chat_id=cb.message.chat.id,
                 audio=out_path,
-                caption=f"✅ Video → MP3\n🎵 {os.path.basename(out_path)}"
+                caption=f"✅ Video → Audio (MP3)\n🎵 {os.path.basename(out_path)}"
             )
             await status.edit("✅ Done ✅")
 
@@ -719,32 +749,29 @@ async def conv_v_mp3(client, cb):
     asyncio.create_task(job())
 
 
-@app.on_callback_query(filters.regex("^conv_f_vid$"))
-async def conv_f_vid(client, cb):
+@app.on_callback_query(filters.regex("^conv_f_mp4$"))
+async def conv_f_mp4(client, cb):
     uid = cb.from_user.id
     media = LAST_MEDIA.get(uid)
     if not media:
-        return await cb.answer("Send audio first.", show_alert=True)
+        return await cb.answer("Send a file first.", show_alert=True)
 
     in_path = media["path"]
-    if not in_path.lower().endswith(".mp3"):
-        return await cb.answer("Only MP3 audio supported.", show_alert=True)
-
-    status = await cb.message.reply("🎬 Converting Audio → Video...")
+    status = await cb.message.reply("🎬 Converting File → MP4...")
 
     async def job():
         out_path = None
         try:
-            out_path = os.path.splitext(in_path)[0] + "_audio.mp4"
-            rc = await mp3_to_mp4(in_path, out_path)
+            out_path = os.path.splitext(in_path)[0] + "_file.mp4"
+            rc = await convert_to_mp4(in_path, out_path)
             if rc != 0 or not os.path.exists(out_path):
-                raise Exception("Audio to Video failed!")
+                raise Exception("File to MP4 failed!")
 
             await send_video_with_meta(
                 client,
                 cb.message.chat.id,
                 out_path,
-                caption=f"✅ Audio → Video\n🎬 {os.path.basename(out_path)}"
+                caption=f"✅ File → MP4\n🎬 {os.path.basename(out_path)}"
             )
             await status.edit("✅ Done ✅")
 
@@ -842,8 +869,10 @@ async def send_type_selected(client, cb):
         mp4_out = None
         try:
             filename, total = await get_filename_and_size(url)
-            if total and total > MAX_SIZE:
-                return await status.edit("❌ URL file too large! Max: 500MB")
+
+            # ✅ URL limit 2GB only
+            if total and total > MAX_URL_SIZE:
+                return await status.edit("❌ URL file too large! Max: 2GB")
 
             if "." not in filename:
                 filename += ".bin"
@@ -865,7 +894,6 @@ async def send_type_selected(client, cb):
                     upload_path = mp4_out
 
                 await status.edit("📤 Uploading video...")
-
                 await send_video_with_meta(
                     client,
                     cb.message.chat.id,
@@ -886,13 +914,7 @@ async def send_type_selected(client, cb):
                     progress_args=(status, uid, up_start)
                 )
 
-            kb2 = InlineKeyboardMarkup([
-                [
-                    InlineKeyboardButton("🗜 Compressor", callback_data="menu_compress"),
-                    InlineKeyboardButton("👑 Converter", callback_data="menu_convert_royal")
-                ]
-            ])
-            await cb.message.reply("✅ Choose option:", reply_markup=kb2)
+            await cb.message.reply("✅ Choose option:", reply_markup=kb_main_menu())
 
             await status.edit("✅ Done ✅")
             await asyncio.sleep(2)
