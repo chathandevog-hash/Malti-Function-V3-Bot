@@ -5,5 +5,5 @@ humanize==4.10.0
 Flask==3.0.3
 gunicorn==22.0.0
 
-# ✅ Instagram Reel Downloader
+# ✅ Instagram Reel + YouTube Downloader
 yt-dlp==2025.01.15
