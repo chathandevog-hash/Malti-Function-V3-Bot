@@ -3,7 +3,6 @@ import re
 import time
 import json
 import zipfile
-import shutil
 import asyncio
 import aiohttp
 import subprocess
@@ -15,10 +14,17 @@ from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from config import BOT_TOKEN, API_ID, API_HASH, DOWNLOAD_DIR
 
 # -------------------------
+# FreeConvert API (Optional)
+# -------------------------
+# Render Env: FREECONVERT_ACCESS_TOKEN
+FREECONVERT_ACCESS_TOKEN = os.getenv("FREECONVERT_ACCESS_TOKEN", "").strip()
+FREECONVERT_BASE = "https://api.freeconvert.com/v1"
+
+# -------------------------
 # Limits
 # -------------------------
 MAX_URL_SIZE = 2 * 1024 * 1024 * 1024      # ✅ 2GB URL uploader
-MAX_COMPRESS_SIZE = 2 * 1024 * 1024 * 1024 # ✅ allow up to 2GB attempt
+MAX_COMPRESS_SIZE = 700 * 1024 * 1024      # ✅ 700MB compressor
 MAX_CONVERT_SIZE = 500 * 1024 * 1024       # ✅ 500MB converter
 
 # -------------------------
@@ -28,13 +34,15 @@ USER_URL = {}
 USER_TASKS = {}
 USER_CANCEL = set()
 LAST_MEDIA = {}          # uid -> {"type": "...", "path": "...", "size": int}
-UI_STATUS_MSG = {}       # uid -> status message object (single message mode)
+UI_STATUS_MSG = {}       # uid -> status message object (single message UI)
+
 
 # -------------------------
 # Helpers
 # -------------------------
 def ensure_dir(p):
     os.makedirs(p, exist_ok=True)
+
 
 def clean_file(p):
     if p and os.path.exists(p):
@@ -43,8 +51,10 @@ def clean_file(p):
         except:
             pass
 
+
 def is_url(text: str):
     return text.startswith("http://") or text.startswith("https://")
+
 
 def safe_filename(name: str):
     name = re.sub(r"[\\/:*?\"<>|]", "_", name)
@@ -53,6 +63,7 @@ def safe_filename(name: str):
         name = f"file_{int(time.time())}"
     return name[:180]
 
+
 def clean_display_name(name: str):
     base = os.path.splitext(name)[0]
     base = unquote(base)
@@ -60,6 +71,7 @@ def clean_display_name(name: str):
     if len(base) > 60:
         base = base[:60].rstrip("_")
     return base or f"file_{int(time.time())}"
+
 
 def format_time(seconds: float):
     if seconds <= 0:
@@ -73,6 +85,7 @@ def format_time(seconds: float):
         return f"{m}m {s}s"
     return f"{s}s"
 
+
 def naturalsize(num_bytes: int):
     if num_bytes is None:
         return "Unknown"
@@ -85,6 +98,7 @@ def naturalsize(num_bytes: int):
         n /= 1024.0
         i += 1
     return f"{n:.2f} {units[i]}"
+
 
 def make_circle_bar(percent: float, slots: int = 14):
     percent = max(0, min(100, percent))
@@ -105,6 +119,7 @@ def make_circle_bar(percent: float, slots: int = 14):
 
     return f"[{icon * filled}{'⚪' * (slots - filled)}]"
 
+
 def make_progress_text(title, done, total, speed, eta):
     percent = (done / total * 100) if total else 0
     bar = make_circle_bar(percent)
@@ -119,6 +134,7 @@ def make_progress_text(title, done, total, speed, eta):
         f"⏳ ETA: **{format_time(eta)}**"
     )
 
+
 def calc_reduction(old_bytes: int, new_bytes: int):
     if not old_bytes or not new_bytes:
         return 0.0
@@ -127,6 +143,7 @@ def calc_reduction(old_bytes: int, new_bytes: int):
         red = 0
     return red
 
+
 async def get_or_create_status(message, uid):
     if uid in UI_STATUS_MSG:
         return UI_STATUS_MSG[uid]
@@ -134,14 +151,17 @@ async def get_or_create_status(message, uid):
     UI_STATUS_MSG[uid] = status
     return status
 
+
 async def safe_edit(msg, text, reply_markup=None):
     try:
         await msg.edit(text, reply_markup=reply_markup)
     except:
         pass
 
+
 def busy(uid: int) -> bool:
     return uid in USER_TASKS and not USER_TASKS[uid].done()
+
 
 # -------------------------
 # Video Meta + Thumb
@@ -169,6 +189,7 @@ def get_video_meta(path: str):
     except:
         return 0, 0, 0
 
+
 async def gen_thumbnail(input_path: str, out_thumb: str):
     dur, _, _ = get_video_meta(input_path)
     ss = dur // 2 if dur and dur > 6 else 3
@@ -190,6 +211,7 @@ async def gen_thumbnail(input_path: str, out_thumb: str):
     await proc.wait()
     return os.path.exists(out_thumb)
 
+
 async def send_video_with_meta(client, chat_id, video_path, caption):
     thumb_path = os.path.splitext(video_path)[0] + "_thumb.jpg"
     try:
@@ -207,6 +229,7 @@ async def send_video_with_meta(client, chat_id, video_path, caption):
         )
     finally:
         clean_file(thumb_path)
+
 
 # -------------------------
 # Progress callbacks (Telegram)
@@ -228,6 +251,7 @@ async def tg_download_progress(current, total, status_msg, uid, start_time):
         kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_{uid}")]])
         await safe_edit(status_msg, make_progress_text("⬇️ Downloading", current, total, speed, eta), kb)
 
+
 async def upload_progress(current, total, status_msg, uid, start_time):
     if uid in USER_CANCEL:
         raise asyncio.CancelledError
@@ -245,6 +269,7 @@ async def upload_progress(current, total, status_msg, uid, start_time):
         kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_{uid}")]])
         await safe_edit(status_msg, make_progress_text("📤 Uploading", current, total, speed, eta), kb)
 
+
 # -------------------------
 # FFmpeg processing progress
 # -------------------------
@@ -258,6 +283,7 @@ def parse_ffmpeg_time(line: str):
         return int(hh) * 3600 + int(mm) * 60 + sec
     except:
         return None
+
 
 async def ffmpeg_with_progress(cmd, status_msg, uid, title: str, total_duration: int):
     start = time.time()
@@ -301,6 +327,208 @@ async def ffmpeg_with_progress(cmd, status_msg, uid, title: str, total_duration:
     await proc.wait()
     return proc.returncode
 
+
+# -------------------------
+# FreeConvert API Compressor (Upload -> Compress -> Export URL)
+# -------------------------
+async def freeconvert_request(session: aiohttp.ClientSession, method: str, url: str, token: str, json_data=None):
+    headers = {
+        "Accept": "application/json",
+        "Authorization": f"Bearer {token}",
+    }
+    if json_data is not None:
+        headers["Content-Type"] = "application/json"
+
+    async with session.request(method, url, headers=headers, json=json_data) as r:
+        try:
+            data = await r.json()
+        except:
+            text = await r.text()
+            raise Exception(f"FreeConvert API invalid response: {text[:200]}")
+
+        if r.status >= 400:
+            raise Exception(f"FreeConvert API Error ({r.status}): {data}")
+        return data
+
+
+async def freeconvert_create_job(session: aiohttp.ClientSession, token: str, input_format: str, output_format: str):
+    payload = {
+        "tasks": {
+            "import-1": {
+                "operation": "import/upload"
+            },
+            "compress-1": {
+                "operation": "compress",
+                "input": "import-1",
+                "input_format": input_format,
+                "output_format": output_format
+            },
+            "export-1": {
+                "operation": "export/url",
+                "input": ["compress-1"]
+            }
+        }
+    }
+    return await freeconvert_request(session, "POST", f"{FREECONVERT_BASE}/process/jobs", token, payload)
+
+
+def freeconvert_find_task(job_json: dict, task_name: str):
+    tasks = job_json.get("tasks") or job_json.get("data", {}).get("tasks")
+    if isinstance(tasks, dict):
+        return tasks.get(task_name)
+    if isinstance(tasks, list):
+        for t in tasks:
+            if t.get("name") == task_name:
+                return t
+    return None
+
+
+async def freeconvert_get_job(session: aiohttp.ClientSession, token: str, job_id: str):
+    return await freeconvert_request(session, "GET", f"{FREECONVERT_BASE}/process/jobs/{job_id}", token)
+
+
+async def freeconvert_wait_finished(session: aiohttp.ClientSession, token: str, job_id: str, status_msg=None, uid=None):
+    start = time.time()
+    while True:
+        if uid and uid in USER_CANCEL:
+            raise asyncio.CancelledError
+
+        job = await freeconvert_get_job(session, token, job_id)
+        status = job.get("status") or job.get("data", {}).get("status")
+        status = (status or "").lower()
+
+        if status_msg:
+            kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_{uid}")]])
+            await safe_edit(status_msg, f"☁️ FreeConvert Processing...\n\n⏳ {int(time.time()-start)}s", kb)
+
+        if status in ["finished", "completed", "success"]:
+            return job
+        if status in ["failed", "error"]:
+            raise Exception("FreeConvert job failed")
+
+        await asyncio.sleep(3)
+
+
+async def freeconvert_upload_file(session: aiohttp.ClientSession, import_task: dict, file_path: str, status_msg=None, uid=None):
+    """
+    FreeConvert import/upload task usually returns upload URL + fields.
+    We'll support both possible structures.
+    """
+    if uid and uid in USER_CANCEL:
+        raise asyncio.CancelledError
+
+    # Try common structures
+    result = import_task.get("result") or import_task.get("data", {}).get("result") or {}
+
+    upload_url = result.get("upload_url") or result.get("url")
+    fields = result.get("fields") or result.get("parameters") or {}
+
+    if not upload_url:
+        # Some APIs return under `form`
+        form = result.get("form") or {}
+        upload_url = form.get("url")
+        fields = form.get("fields") or form.get("parameters") or fields
+
+    if not upload_url:
+        raise Exception(f"FreeConvert import task missing upload url: {import_task}")
+
+    data = aiohttp.FormData()
+    for k, v in fields.items():
+        data.add_field(k, str(v))
+
+    # file must be last
+    with open(file_path, "rb") as f:
+        data.add_field("file", f, filename=os.path.basename(file_path), content_type="application/octet-stream")
+        async with session.post(upload_url, data=data) as r:
+            if r.status >= 400:
+                txt = await r.text()
+                raise Exception(f"FreeConvert upload failed: HTTP {r.status} {txt[:200]}")
+
+    if status_msg:
+        await safe_edit(status_msg, "✅ Uploaded to FreeConvert ☁️")
+
+
+def freeconvert_export_url(job_json: dict):
+    tasks = job_json.get("tasks") or job_json.get("data", {}).get("tasks")
+    if isinstance(tasks, dict):
+        export = tasks.get("export-1")
+        if not export:
+            return None
+        res = export.get("result") or {}
+        files = res.get("files") or []
+        if files:
+            return files[0].get("url")
+        return res.get("url")
+
+    if isinstance(tasks, list):
+        for t in tasks:
+            if t.get("operation") == "export/url":
+                res = t.get("result") or {}
+                files = res.get("files") or []
+                if files:
+                    return files[0].get("url")
+    return None
+
+
+async def freeconvert_compress_and_send(client, chat_id: int, input_path: str, status_msg, uid: int,
+                                       input_format: str = "mp4", output_format: str = "mp4"):
+    if not FREECONVERT_ACCESS_TOKEN:
+        raise Exception("FREECONVERT_ACCESS_TOKEN not set in Render env")
+
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=None)) as session:
+        await safe_edit(status_msg, "☁️ FreeConvert: Creating job...")
+        job = await freeconvert_create_job(session, FREECONVERT_ACCESS_TOKEN, input_format, output_format)
+
+        job_id = job.get("id") or job.get("data", {}).get("id")
+        if not job_id:
+            raise Exception(f"FreeConvert job_id missing: {job}")
+
+        import_task = freeconvert_find_task(job, "import-1")
+        if not import_task:
+            job_full = await freeconvert_get_job(session, FREECONVERT_ACCESS_TOKEN, job_id)
+            import_task = freeconvert_find_task(job_full, "import-1")
+        if not import_task:
+            raise Exception("FreeConvert import task missing")
+
+        await safe_edit(status_msg, "☁️ FreeConvert: Uploading file...")
+        await freeconvert_upload_file(session, import_task, input_path, status_msg, uid)
+
+        done = await freeconvert_wait_finished(session, FREECONVERT_ACCESS_TOKEN, job_id, status_msg, uid)
+
+        url = freeconvert_export_url(done)
+        if not url:
+            raise Exception("FreeConvert export URL missing")
+
+        out_path = os.path.join(DOWNLOAD_DIR, f"freeconvert_{uid}_{int(time.time())}.{output_format}")
+        await safe_edit(status_msg, "⬇️ Downloading compressed output...")
+        await download_stream(url, out_path, status_msg, uid)
+
+        await safe_edit(status_msg, "📤 Uploading to Telegram...")
+        up_start = time.time()
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_{uid}")]])
+        await safe_edit(status_msg, "📤 Uploading...", reply_markup=kb)
+
+        if output_format.lower() in ["mp4", "mkv", "mov", "webm"]:
+            await client.send_video(
+                chat_id=chat_id,
+                video=out_path,
+                caption="✅ Compressed via FreeConvert ☁️",
+                supports_streaming=True,
+                progress=upload_progress,
+                progress_args=(status_msg, uid, up_start)
+            )
+        else:
+            await client.send_document(
+                chat_id=chat_id,
+                document=out_path,
+                caption="✅ Compressed via FreeConvert ☁️",
+                progress=upload_progress,
+                progress_args=(status_msg, uid, up_start)
+            )
+
+        clean_file(out_path)
+
+
 # -------------------------
 # URL download (aiohttp)
 # -------------------------
@@ -328,6 +556,7 @@ async def get_filename_and_size(url: str):
     if not filename:
         filename = f"file_{int(time.time())}.bin"
     return safe_filename(filename), total
+
 
 async def download_stream(url, file_path, status_msg, uid):
     USER_CANCEL.discard(uid)
@@ -366,7 +595,12 @@ async def download_stream(url, file_path, status_msg, uid):
                     if time.time() - last_edit > 2:
                         last_edit = time.time()
                         kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_{uid}")]])
-                        await safe_edit(status_msg, make_progress_text("⬇️ Downloading", downloaded, total, speed, eta), kb)
+                        await safe_edit(
+                            status_msg,
+                            make_progress_text("⬇️ Downloading", downloaded, total, speed, eta),
+                            reply_markup=kb
+                        )
+
 
 # -------------------------
 # FFmpeg tools
@@ -382,110 +616,16 @@ QUALITY_MAP = {
     "144":  (256, 144),
 }
 
-def choose_segment_time(size_bytes: int) -> int:
-    """
-    ✅ ALWAYS split, but smart split:
-    small files -> longer parts (less overhead)
-    big files -> shorter parts (safer)
-    """
-    mb = size_bytes / (1024 * 1024)
-
-    if mb < 150:
-        return 240   # 4 min
-    if mb < 500:
-        return 360   # 6 min
-    if mb < 1200:
-        return 600   # 10 min
-    if mb < 1700:
-        return 420   # 7 min
-    return 300       # 5 min
 
 # -------------------------
-# ALWAYS SPLIT + COMPRESS + MERGE
-# -------------------------
-async def split_video_to_parts(input_path: str, parts_dir: str, uid: int, status_msg):
-    ensure_dir(parts_dir)
-    size = os.path.getsize(input_path)
-    segment_time = choose_segment_time(size)
-
-    out_pattern = os.path.join(parts_dir, "part_%03d.mp4")
-    dur, _, _ = get_video_meta(input_path)
-    dur = dur or max(300, segment_time)
-
-    cmd = [
-        "ffmpeg", "-y",
-        "-i", input_path,
-        "-map", "0:v:0?",
-        "-map", "0:a:0?",
-        "-c", "copy",
-        "-f", "segment",
-        "-reset_timestamps", "1",
-        "-segment_time", str(segment_time),
-        out_pattern
-    ]
-
-    rc = await ffmpeg_with_progress(cmd, status_msg, uid, "Splitting Video", dur)
-    if rc != 0:
-        raise Exception("Split failed")
-
-    parts = []
-    for fn in sorted(os.listdir(parts_dir)):
-        if fn.startswith("part_") and fn.endswith(".mp4"):
-            parts.append(os.path.join(parts_dir, fn))
-
-    if not parts:
-        raise Exception("Split failed: no parts created")
-
-    return parts
-
-async def compress_one_part(part_path: str, out_path: str, q: str, uid: int, status_msg):
-    dur, _, _ = get_video_meta(part_path)
-    dur = dur or 180
-    w, h = QUALITY_MAP[q]
-
-    # more aggressive compress for low qualities
-    low_mode = int(q) <= 360
-    crf = "31" if low_mode else "28"
-    ab = "64k" if low_mode else "96k"
-
-    cmd = [
-        "ffmpeg", "-y",
-        "-i", part_path,
-        "-vf", f"scale={w}:{h}",
-        "-c:v", "libx264",
-        "-preset", "veryfast",
-        "-crf", crf,
-        "-c:a", "aac",
-        "-b:a", ab,
-        "-movflags", "+faststart",
-        "-pix_fmt", "yuv420p",
-        out_path
-    ]
-    rc = await ffmpeg_with_progress(cmd, status_msg, uid, f"Compressing Part ({q}p)", dur)
-    if rc != 0 or not os.path.exists(out_path):
-        raise Exception("Part compression failed")
-
-async def merge_parts_to_video(parts: list, out_path: str, uid: int, status_msg):
-    list_path = os.path.join(os.path.dirname(out_path), "list.txt")
-    with open(list_path, "w", encoding="utf-8") as f:
-        for p in parts:
-            f.write(f"file '{p}'\n")
-
-    cmd = ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", list_path, "-c", "copy", out_path]
-    rc = await ffmpeg_with_progress(cmd, status_msg, uid, "Merging Parts", 60)
-    clean_file(list_path)
-
-    if rc != 0 or not os.path.exists(out_path):
-        raise Exception("Merge failed")
-
-# -------------------------
-# File compressor (ZIP)
+# File compressor (ZIP fallback)
 # -------------------------
 async def compress_file_zip(input_path: str, out_zip: str):
     ensure_dir(os.path.dirname(out_zip))
     with zipfile.ZipFile(out_zip, "w", compression=zipfile.ZIP_DEFLATED) as z:
         z.write(input_path, arcname=os.path.basename(input_path))
     return os.path.exists(out_zip)
+
 
 # -------------------------
 # UI Menus
@@ -499,14 +639,16 @@ def kb_main_menu():
         ]
     ])
 
+
 def kb_compress_menu():
     return InlineKeyboardMarkup([
         [
             InlineKeyboardButton("🎥 Video Compress", callback_data="compress_video_menu"),
-            InlineKeyboardButton("📁 File Compress (ZIP)", callback_data="compress_file_zip")
+            InlineKeyboardButton("📁 File Compress", callback_data="compress_file_zip")
         ],
         [InlineKeyboardButton("🔙 Back", callback_data="back_main")]
     ])
+
 
 def kb_converter_menu():
     return InlineKeyboardMarkup([
@@ -521,6 +663,7 @@ def kb_converter_menu():
         [InlineKeyboardButton("🔙 Back", callback_data="back_main")]
     ])
 
+
 # -------------------------
 # Bot init
 # -------------------------
@@ -530,6 +673,7 @@ app = Client(
     api_id=API_ID,
     api_hash=API_HASH
 )
+
 
 # -------------------------
 # Start
@@ -543,15 +687,24 @@ async def start_cmd(client, message):
         "✨ Welcome to Multifunctional Bot! 🤖💫\n"
         "Here you can do multiple things in one bot 🚀\n\n"
         "🌐 URL Uploader\n"
-        "➜ Upload direct links (Max: 2GB) ✅\n\n"
+        "➜ Send any direct link and I will upload it for you instantly ✅\n"
+        "⚡ URL Limit: 2GB\n\n"
         "🗜️ Compressor\n"
-        "➜ Compress Video / File ✅\n"
-        "⚡ ALWAYS Split → Compress → Merge enabled 🔥\n\n"
+        "➜ Reduce file/video size easily without hassle ⚡\n"
+        "⚠️ Compression Limit: 700MB\n\n"
         "🎛️ Converter\n"
-        "➜ Convert files (Max: 500MB) 🎬🎵\n\n"
+        "➜ Convert your files into different formats (mp4 / mp3 / mkv etc.) 🎬🎵\n"
+        "⚠️ Conversion Limit: 500MB\n\n"
+        "📌 How to use?\n"
+        "1️⃣ Send a File / Video / Audio / URL\n"
+        "2️⃣ Select your needed option ✅\n"
+        "3️⃣ Wait for processing ⏳\n"
+        "4️⃣ Get your output 🎉\n\n"
         "🚀 Now send something to start 👇😊"
     )
+
     await message.reply(text, reply_markup=kb_main_menu())
+
 
 # -------------------------
 # Back buttons
@@ -560,13 +713,16 @@ async def start_cmd(client, message):
 async def back_main(client, cb):
     await cb.message.edit("✅ Choose option:", reply_markup=kb_main_menu())
 
+
 @app.on_callback_query(filters.regex("^back_compress$"))
 async def back_compress(client, cb):
     await cb.message.edit("🗜 Choose Compression Type:", reply_markup=kb_compress_menu())
 
+
 @app.on_callback_query(filters.regex("^back_convert$"))
 async def back_convert(client, cb):
     await cb.message.edit("👑 Converter Menu\n👇 Choose conversion type:", reply_markup=kb_converter_menu())
+
 
 # -------------------------
 # Cancel
@@ -590,6 +746,7 @@ async def cancel_task(client, cb):
     except:
         pass
 
+
 # -------------------------
 # URL message
 # -------------------------
@@ -601,6 +758,7 @@ async def url_handler(client, message):
     if text.startswith("/"):
         return
 
+    # ✅ URL Flow
     if is_url(text):
         if busy(uid):
             return await message.reply("⚠️ One process already running. Please wait or cancel.")
@@ -615,6 +773,7 @@ async def url_handler(client, message):
         return await message.reply("✅ URL Received!\n\n👇 Select upload type:", reply_markup=kb)
 
     return await message.reply("❌ Send a direct URL or send a media file.")
+
 
 # -------------------------
 # Media received (Telegram)
@@ -643,15 +802,14 @@ async def file_received(client, message):
     else:
         return await message.reply("❌ Unsupported media type.")
 
-    if size > MAX_COMPRESS_SIZE:
-        return await message.reply(
-            f"❌ File too large!\n\nMax allowed: 2GB\nYour file: {naturalsize(size)}"
-        )
+    if size > MAX_URL_SIZE:
+        return await message.reply(f"❌ Too large!\nMax: 2GB\nYour file: {naturalsize(size)}")
 
     status = await get_or_create_status(message, uid)
     start_time = time.time()
 
     async def job():
+        local_path = None
         try:
             await safe_edit(status, "⬇️ Starting Telegram download...")
 
@@ -662,7 +820,6 @@ async def file_received(client, message):
             )
 
             LAST_MEDIA[uid] = {"type": media_type, "path": local_path, "size": size}
-
             await safe_edit(status, "✅ Media received.\n👇 Choose option:", reply_markup=kb_main_menu())
 
         except Exception as e:
@@ -670,6 +827,7 @@ async def file_received(client, message):
 
     t = asyncio.create_task(job())
     USER_TASKS[uid] = t
+
 
 # -------------------------
 # Menu callbacks
@@ -679,13 +837,16 @@ async def menu_url(client, cb):
     await cb.answer("✅")
     await cb.message.reply("🌐 Send direct URL now ✅")
 
+
 @app.on_callback_query(filters.regex("^menu_compress$"))
 async def menu_compress(client, cb):
     await cb.message.edit("🗜 Choose Compression Type:", reply_markup=kb_compress_menu())
 
+
 @app.on_callback_query(filters.regex("^menu_convert$"))
 async def menu_convert(client, cb):
     await cb.message.edit("👑 Converter Menu\n👇 Choose conversion type:", reply_markup=kb_converter_menu())
+
 
 # -------------------------
 # Video compress menu
@@ -700,6 +861,7 @@ async def compress_video_menu(client, cb):
         [InlineKeyboardButton("🔙 Back", callback_data="back_compress")]
     ])
     await cb.message.edit("🎥 Select Video Compression:", reply_markup=kb)
+
 
 @app.on_callback_query(filters.regex("^compress_high$"))
 async def compress_high(client, cb):
@@ -717,6 +879,7 @@ async def compress_high(client, cb):
     ])
     await cb.message.edit("✨ Select Higher Quality:", reply_markup=kb)
 
+
 @app.on_callback_query(filters.regex("^compress_low$"))
 async def compress_low(client, cb):
     kb = InlineKeyboardMarkup([
@@ -729,8 +892,9 @@ async def compress_low(client, cb):
     ])
     await cb.message.edit("📉 Select Lower Quality:", reply_markup=kb)
 
+
 # -------------------------
-# Video compressor action (ALWAYS SPLIT)
+# Video compressor action
 # -------------------------
 @app.on_callback_query(filters.regex(r"^q_\d+$"))
 async def quality_selected(client, cb):
@@ -740,52 +904,75 @@ async def quality_selected(client, cb):
     if not media or media["type"] != "video":
         return await cb.answer("❌ Send a video first.", show_alert=True)
 
+    if media["size"] > MAX_COMPRESS_SIZE:
+        return await cb.answer("❌ Over limit 700MB!", show_alert=True)
+
     q = cb.data.split("_", 1)[1]
     in_path = media["path"]
+
     status = await get_or_create_status(cb.message, uid)
 
     async def job():
         out_path = None
-        parts_dir = None
         try:
             USER_CANCEL.discard(uid)
 
             old_size = os.path.getsize(in_path)
+            out_path = os.path.splitext(in_path)[0] + f"_{q}p.mp4"
 
-            parts_dir = os.path.join(DOWNLOAD_DIR, f"split_{uid}_{int(time.time())}")
-            await safe_edit(status, "⚡ Split → Compress → Merge MODE ON ✅🔥")
+            dur, _, _ = get_video_meta(in_path)
+            dur = dur or 60
 
-            # split
-            parts = await split_video_to_parts(in_path, parts_dir, uid, status)
+            # ✅ Try FreeConvert API first (low memory). If fails, fallback to local ffmpeg.
+            try:
+                if FREECONVERT_ACCESS_TOKEN:
+                    await freeconvert_compress_and_send(
+                        client,
+                        cb.message.chat.id,
+                        in_path,
+                        status,
+                        uid,
+                        input_format="mp4",
+                        output_format="mp4"
+                    )
+                else:
+                    raise Exception("FreeConvert token not set")
+            except Exception as api_err:
+                await safe_edit(status, f"⚠️ FreeConvert Failed, using local FFmpeg...\n\nReason: `{api_err}`")
 
-            # compress each part
-            out_parts = []
-            for idx, part in enumerate(parts):
-                if uid in USER_CANCEL:
-                    raise asyncio.CancelledError
-                out_p = os.path.join(parts_dir, f"out_{idx:03d}.mp4")
-                await compress_one_part(part, out_p, q, uid, status)
-                out_parts.append(out_p)
+                cmd = [
+                    "ffmpeg", "-y",
+                    "-i", in_path,
+                    "-vf", f"scale={QUALITY_MAP[q][0]}:{QUALITY_MAP[q][1]}",
+                    "-c:v", "libx264",
+                    "-preset", "veryfast",
+                    "-crf", "28",
+                    "-c:a", "aac",
+                    "-b:a", "96k",
+                    "-movflags", "+faststart",
+                    "-pix_fmt", "yuv420p",
+                    out_path
+                ]
 
-            # merge
-            out_path = os.path.splitext(in_path)[0] + f"_{q}p_SPLIT.mp4"
-            await merge_parts_to_video(out_parts, out_path, uid, status)
+                rc = await ffmpeg_with_progress(cmd, status, uid, f"Compressing to {q}p", dur)
+                if rc != 0 or not os.path.exists(out_path):
+                    raise Exception("Compression failed")
 
-            new_size = os.path.getsize(out_path)
-            reduced = calc_reduction(old_size, new_size)
+                new_size = os.path.getsize(out_path)
+                reduced = calc_reduction(old_size, new_size)
 
-            await send_video_with_meta(
-                client,
-                cb.message.chat.id,
-                out_path,
-                caption=(
-                    f"✅ Compression Finished 🗜\n\n"
-                    f"📺 Quality: {q}p\n"
-                    f"📦 Original: {naturalsize(old_size)}\n"
-                    f"📉 New: {naturalsize(new_size)}\n"
-                    f"💯 Reduced: {reduced:.2f}%"
+                await send_video_with_meta(
+                    client,
+                    cb.message.chat.id,
+                    out_path,
+                    caption=(
+                        f"✅ Compression Finished 🗜\n\n"
+                        f"📺 Quality: {q}p\n"
+                        f"📦 Original: {naturalsize(old_size)}\n"
+                        f"📉 New: {naturalsize(new_size)}\n"
+                        f"💯 Reduced: {reduced:.2f}%"
+                    )
                 )
-            )
 
             await safe_edit(status, "✅ Done ✅", reply_markup=kb_main_menu())
 
@@ -795,18 +982,14 @@ async def quality_selected(client, cb):
             await safe_edit(status, f"❌ Failed!\n\nError: `{e}`", reply_markup=kb_main_menu())
         finally:
             clean_file(out_path)
-            if parts_dir and os.path.exists(parts_dir):
-                try:
-                    shutil.rmtree(parts_dir, ignore_errors=True)
-                except:
-                    pass
             USER_CANCEL.discard(uid)
 
     t = asyncio.create_task(job())
     USER_TASKS[uid] = t
 
+
 # -------------------------
-# File Compress ZIP
+# File Compress (API -> ZIP fallback)
 # -------------------------
 @app.on_callback_query(filters.regex("^compress_file_zip$"))
 async def file_compress_zip(client, cb):
@@ -815,13 +998,10 @@ async def file_compress_zip(client, cb):
     if not media:
         return await cb.answer("❌ Send file first.", show_alert=True)
 
+    if media["size"] > MAX_COMPRESS_SIZE:
+        return await cb.answer("❌ Over limit 700MB!", show_alert=True)
+
     in_path = media["path"]
-    if not os.path.exists(in_path):
-        return await cb.answer("❌ File missing.", show_alert=True)
-
-    if os.path.getsize(in_path) > MAX_COMPRESS_SIZE:
-        return await cb.answer("❌ Over 2GB not allowed.", show_alert=True)
-
     out_zip = os.path.splitext(in_path)[0] + "_compressed.zip"
     status = await get_or_create_status(cb.message, uid)
 
@@ -831,9 +1011,34 @@ async def file_compress_zip(client, cb):
             old_size = os.path.getsize(in_path)
 
             kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_{uid}")]])
-            await safe_edit(status, "📦 Compressing file (ZIP)...", kb)
+            await safe_edit(status, "📦 Compressing file...", reply_markup=kb)
 
-            await compress_file_zip(in_path, out_zip)
+            # ✅ Try FreeConvert API first (low memory). If fails, fallback to ZIP.
+            try:
+                if not FREECONVERT_ACCESS_TOKEN:
+                    raise Exception("FreeConvert token not set")
+
+                ext = os.path.splitext(in_path)[1].lower().replace(".", "")
+                if not ext:
+                    ext = "bin"
+
+                await freeconvert_compress_and_send(
+                    client,
+                    cb.message.chat.id,
+                    in_path,
+                    status,
+                    uid,
+                    input_format=ext,
+                    output_format=ext
+                )
+
+                await safe_edit(status, "✅ Done ✅", reply_markup=kb_main_menu())
+                return
+
+            except Exception as api_err:
+                await safe_edit(status, f"⚠️ FreeConvert Failed, using ZIP...\n\nReason: `{api_err}`", reply_markup=kb)
+
+                await compress_file_zip(in_path, out_zip)
 
             if uid in USER_CANCEL:
                 raise asyncio.CancelledError
@@ -864,8 +1069,9 @@ async def file_compress_zip(client, cb):
     t = asyncio.create_task(job())
     USER_TASKS[uid] = t
 
+
 # -------------------------
-# Converter actions (unchanged, stable)
+# Converter actions
 # -------------------------
 @app.on_callback_query(filters.regex("^conv_v_mp3$"))
 async def conv_v_mp3(client, cb):
@@ -907,6 +1113,7 @@ async def conv_v_mp3(client, cb):
     t = asyncio.create_task(job())
     USER_TASKS[uid] = t
 
+
 @app.on_callback_query(filters.regex("^conv_v_file$"))
 async def conv_v_file(client, cb):
     uid = cb.from_user.id
@@ -920,6 +1127,7 @@ async def conv_v_file(client, cb):
 
     await client.send_document(cb.message.chat.id, media["path"], caption="✅ Video → File 📁")
     await cb.answer("✅ Done")
+
 
 @app.on_callback_query(filters.regex("^conv_v_mp4$"))
 async def conv_v_mp4(client, cb):
@@ -971,6 +1179,7 @@ async def conv_v_mp4(client, cb):
     t = asyncio.create_task(job())
     USER_TASKS[uid] = t
 
+
 @app.on_callback_query(filters.regex("^conv_f_mp4$"))
 async def conv_f_mp4(client, cb):
     uid = cb.from_user.id
@@ -1017,6 +1226,7 @@ async def conv_f_mp4(client, cb):
     t = asyncio.create_task(job())
     USER_TASKS[uid] = t
 
+
 # -------------------------
 # URL Upload Selection
 # -------------------------
@@ -1056,16 +1266,15 @@ async def send_type_selected(client, cb):
             if uid in USER_CANCEL:
                 raise asyncio.CancelledError
 
+            size_bytes = os.path.getsize(file_path)
+            clean_name = clean_display_name(os.path.basename(file_path))
+
             if mode == "video":
-                clean_name = clean_display_name(os.path.basename(file_path))
-                size_bytes = os.path.getsize(file_path)
                 await send_video_with_meta(
                     client, cb.message.chat.id, file_path,
                     caption=f"✅ URL Uploaded 🎥\n\n📌 Name: `{clean_name}`\n📦 Size: **{naturalsize(size_bytes)}**"
                 )
             else:
-                clean_name = clean_display_name(os.path.basename(file_path))
-                size_bytes = os.path.getsize(file_path)
                 up_start = time.time()
                 await client.send_document(
                     chat_id=cb.message.chat.id,
@@ -1088,6 +1297,7 @@ async def send_type_selected(client, cb):
 
     t = asyncio.create_task(job())
     USER_TASKS[uid] = t
+
 
 # -------------------------
 # Main
