@@ -13,6 +13,9 @@ from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 from config import BOT_TOKEN, API_ID, API_HASH, DOWNLOAD_DIR
 
+# ✅ NEW: Instagram Reel downloader module
+from insta import is_instagram_url, clean_insta_url, insta_download
+
 # -------------------------
 # FreeConvert API
 # -------------------------
@@ -36,8 +39,12 @@ USER_CANCEL = set()
 LAST_MEDIA = {}          # uid -> {"type": "...", "path": "...", "size": int, "name": str}
 UI_STATUS_MSG = {}       # uid -> status message
 
+# ✅ NEW: Instagram URL store
+USER_INSTA = {}
+
 # retry config
 MAX_RETRY = 3
+MAX_RETRY_INSTA = 2
 
 # -------------------------
 # Helpers
@@ -155,9 +162,6 @@ async def tinyurl_shorten(long_url: str):
 # Video meta info
 # -------------------------
 def ffprobe_video_info(path: str):
-    """
-    returns (duration_sec, w, h, fps)
-    """
     try:
         p = subprocess.run(
             ["ffprobe", "-v", "error",
@@ -289,7 +293,7 @@ async def download_stream(url, file_path, status_msg, uid):
                         await safe_edit(status_msg, make_progress_text("⬇️ Downloading", downloaded, total, speed, eta), kb)
 
 # -------------------------
-# FreeConvert API helpers (URL+FILE input)
+# FreeConvert API helpers
 # -------------------------
 async def freeconvert_request(session: aiohttp.ClientSession, method: str, url: str, token: str, json_data=None):
     headers = {"Accept": "application/json", "Authorization": f"Bearer {token}"}
@@ -368,22 +372,6 @@ async def freeconvert_create_job_file(session, token, ext):
     }
     return await freeconvert_request(session, "POST", f"{FREECONVERT_BASE}/process/jobs", token, payload)
 
-async def freeconvert_create_job_url(session, token, ext, input_url: str):
-    # ✅ URL compress without downloading locally
-    payload = {
-        "tasks": {
-            "import-1": {"operation": "import/url", "url": input_url},
-            "compress-1": {
-                "operation": "compress",
-                "input": "import-1",
-                "input_format": ext,
-                "output_format": ext
-            },
-            "export-1": {"operation": "export/url", "input": ["compress-1"]}
-        }
-    }
-    return await freeconvert_request(session, "POST", f"{FREECONVERT_BASE}/process/jobs", token, payload)
-
 async def freeconvert_upload_file(session: aiohttp.ClientSession, import_task: dict, file_path: str):
     result = import_task.get("result") or {}
     upload_url = result.get("upload_url") or result.get("url")
@@ -438,26 +426,6 @@ async def freeconvert_compress_file_return_link(local_path: str, status_msg, uid
 
         await safe_edit(status_msg, "☁️ Uploading to FreeConvert...")
         await freeconvert_upload_file(session, import_task, local_path)
-
-        done = await freeconvert_wait_finished(session, FREECONVERT_ACCESS_TOKEN, job_id, status_msg, uid)
-        url = freeconvert_export_url(done)
-        if not url:
-            raise Exception("FreeConvert export URL missing")
-        return url
-
-async def freeconvert_compress_url_return_link(input_url: str, status_msg, uid: int):
-    if not FREECONVERT_ACCESS_TOKEN:
-        raise Exception("FREECONVERT_ACCESS_TOKEN not set in Render env")
-
-    ext = os.path.splitext(urlparse(input_url).path)[1].lower().replace(".", "")
-    if not ext:
-        ext = "mp4"
-
-    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=None)) as session:
-        job = await freeconvert_create_job_url(session, FREECONVERT_ACCESS_TOKEN, ext, input_url)
-        job_id = job.get("id")
-        if not job_id:
-            raise Exception("FreeConvert job_id missing")
 
         done = await freeconvert_wait_finished(session, FREECONVERT_ACCESS_TOKEN, job_id, status_msg, uid)
         url = freeconvert_export_url(done)
@@ -524,26 +492,14 @@ app = Client(
     api_hash=API_HASH
 )
 
-# -------------------------
-# Start
-# -------------------------
 WELCOME_TEXT = (
     "✨ Welcome to Multifunctional Bot! 🤖💫\n"
-    "Here you can do multiple things in one bot 🚀\n\n"
-    "🌐 URL Uploader\n"
-    "➜ Send any direct link and I will upload it for you instantly ✅\n\n"
-    "🗜️ Compressor\n"
-    "➜ Reduce file/video size easily without hassle ⚡\n\n"
-    "🎛️ Converter\n"
-    "➜ Convert your files into different formats (mp4 / mp3 etc.) 🎬🎵\n\n"
-    "📌 How to use?\n"
-    "1️⃣ Send a File / Video / URL\n"
-    "2️⃣ Select your needed option ✅\n"
-    "3️⃣ Wait for processing ⏳\n"
-    "4️⃣ Get your output 🎉\n\n"
     "🚀 Now send something to start 👇😊"
 )
 
+# -------------------------
+# Start
+# -------------------------
 @app.on_message(filters.private & filters.command("start"))
 async def start_cmd(client, message):
     uid = message.from_user.id
@@ -560,7 +516,7 @@ async def back_main(client, cb):
 @app.on_callback_query(filters.regex("^menu_url$"))
 async def menu_url(client, cb):
     await cb.answer("✅")
-    await cb.message.reply("🌐 Send direct URL now ✅")
+    await cb.message.reply("🌐 Send direct URL OR Instagram Reel URL ✅")
 
 @app.on_callback_query(filters.regex("^menu_compress$"))
 async def menu_compress(client, cb):
@@ -592,7 +548,7 @@ async def cancel_task(client, cb):
         pass
 
 # -------------------------
-# Text handler
+# Text handler (URL + ✅ Instagram URL)
 # -------------------------
 @app.on_message(filters.private & filters.text)
 async def text_handler(client, message):
@@ -602,6 +558,28 @@ async def text_handler(client, message):
     if text.startswith("/"):
         return
 
+    # ✅ Instagram Reel URL handler
+    if is_instagram_url(text):
+        if busy(uid):
+            return await message.reply("⚠️ Already processing. Please wait/cancel.")
+
+        insta_url = clean_insta_url(text)
+        USER_INSTA[uid] = insta_url
+
+        kb = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("🎥 Video", callback_data="insta_video"),
+                InlineKeyboardButton("📁 File", callback_data="insta_file")
+            ],
+            [InlineKeyboardButton("🔙 Back", callback_data="back_main")]
+        ])
+
+        return await message.reply(
+            f"✅ **Instagram Reel Detected 📸**\n\n📌 Link:\n`{insta_url}`\n\n👇 Select format:",
+            reply_markup=kb
+        )
+
+    # normal url
     if is_url(text):
         if busy(uid):
             return await message.reply("⚠️ One process already running. Please wait or cancel.")
@@ -613,10 +591,91 @@ async def text_handler(client, message):
             reply_markup=kb_url_mode_menu()
         )
 
-    return await message.reply("❌ Send a direct URL or send a media file.")
+    return await message.reply("❌ Send a direct URL / Instagram reel URL / or media file.")
 
 # -------------------------
-# Media received (Feature 1)
+# ✅ Instagram callbacks
+# -------------------------
+@app.on_callback_query(filters.regex(r"^insta_(video|file)$"))
+async def insta_handler(client, cb):
+    uid = cb.from_user.id
+    if uid not in USER_INSTA:
+        return await cb.answer("❌ Send Instagram link again.", show_alert=True)
+    if busy(uid):
+        return await cb.answer("⚠️ Already processing one task.", show_alert=True)
+
+    mode = cb.data.split("_", 1)[1]
+    url = USER_INSTA[uid]
+    status = await get_or_create_status(cb.message, uid)
+
+    async def job():
+        video_path = None
+        thumb = None
+        try:
+            USER_CANCEL.discard(uid)
+            kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_{uid}")]])
+
+            # retry insta
+            last_err = None
+            for attempt in range(1, MAX_RETRY_INSTA + 1):
+                try:
+                    await safe_edit(status, f"📥 Instagram downloading...\n🔁 Attempt {attempt}/{MAX_RETRY_INSTA}", kb)
+                    video_path = await insta_download(url, uid, status)
+                    break
+                except Exception as e:
+                    last_err = e
+                    await asyncio.sleep(1)
+
+            if not video_path:
+                raise Exception(last_err)
+
+            if uid in USER_CANCEL:
+                raise asyncio.CancelledError
+
+            size = os.path.getsize(video_path)
+            name = os.path.basename(video_path)
+
+            # thumbnail preview
+            thumb = os.path.splitext(video_path)[0] + "_insta.jpg"
+            try:
+                await gen_thumbnail(video_path, thumb)
+            except:
+                pass
+
+            await safe_edit(status, "📤 Uploading reel...", kb)
+
+            if mode == "video":
+                await client.send_video(
+                    chat_id=cb.message.chat.id,
+                    video=video_path,
+                    caption=f"✅ Instagram Reel Downloaded 🎥\n\n📌 `{name}`\n📦 {naturalsize(size)}",
+                    thumb=thumb if thumb and os.path.exists(thumb) else None,
+                    supports_streaming=True
+                )
+            else:
+                await client.send_document(
+                    chat_id=cb.message.chat.id,
+                    document=video_path,
+                    caption=f"✅ Instagram Reel Downloaded 📁\n\n📌 `{name}`\n📦 {naturalsize(size)}"
+                )
+
+            await safe_edit(status, "✅ Done ✅", reply_markup=kb_main_menu())
+
+        except asyncio.CancelledError:
+            await safe_edit(status, "❌ Cancelled ✅", reply_markup=kb_main_menu())
+        except Exception as e:
+            await safe_edit(status, f"❌ Insta Failed!\n\nError: `{e}`", reply_markup=kb_main_menu())
+        finally:
+            USER_INSTA.pop(uid, None)
+            clean_file(thumb)
+            clean_file(video_path)
+            USER_CANCEL.discard(uid)
+
+    t = asyncio.create_task(job())
+    USER_TASKS[uid] = t
+
+# -------------------------
+# Media received (unchanged)
 # -------------------------
 @app.on_message(filters.private & filters.media)
 async def file_received(client, message):
@@ -661,7 +720,6 @@ async def file_received(client, message):
 
             LAST_MEDIA[uid] = {"type": media_type, "path": local_path, "size": size, "name": name}
 
-            # feature 1: show info
             extra = ""
             if media_type == "video":
                 dur, w, h, fps = ffprobe_video_info(local_path)
@@ -671,7 +729,6 @@ async def file_received(client, message):
                     f"\n🎞 FPS: `{fps}`"
                 )
 
-                # feature 8: thumb preview
                 thumb_path = os.path.splitext(local_path)[0] + "_preview.jpg"
                 try:
                     ok = await gen_thumbnail(local_path, thumb_path)
@@ -703,7 +760,7 @@ async def file_received(client, message):
     USER_TASKS[uid] = t
 
 # -------------------------
-# Compressor UI (High/Low -> Quality buttons)
+# Compressor menu (unchanged)
 # -------------------------
 @app.on_callback_query(filters.regex("^compress_menu$"))
 async def compress_menu(client, cb):
@@ -757,7 +814,6 @@ async def select_quality(client, cb):
                 return await freeconvert_compress_file_return_link(local_path, status, uid)
 
             url = await retry_run(run, status, uid, label="Compression")
-
             short = await tinyurl_shorten(url)
 
             await safe_edit(
@@ -775,7 +831,6 @@ async def select_quality(client, cb):
         except Exception as e:
             await safe_edit(status, f"❌ Failed!\n\nError: `{e}`", reply_markup=kb_main_menu())
         finally:
-            # feature 4 cleanup
             clean_file(local_path)
             LAST_MEDIA.pop(uid, None)
             USER_CANCEL.discard(uid)
@@ -784,7 +839,7 @@ async def select_quality(client, cb):
     USER_TASKS[uid] = t
 
 # -------------------------
-# URL uploader selection
+# URL uploader selection (unchanged)
 # -------------------------
 @app.on_callback_query(filters.regex("^(send_file|send_video)$"))
 async def send_type_selected(client, cb):
@@ -844,67 +899,12 @@ async def send_type_selected(client, cb):
         except Exception as e:
             await safe_edit(status, f"❌ Failed!\n\nError: `{e}`", reply_markup=kb_main_menu())
         finally:
-            # feature 4 cleanup
             USER_URL.pop(uid, None)
             clean_file(file_path)
             USER_CANCEL.discard(uid)
 
     t = asyncio.create_task(job())
     USER_TASKS[uid] = t
-
-# -------------------------
-# Feature 2: URL Compress Link
-# -------------------------
-@app.on_callback_query(filters.regex("^url_compress_menu$"))
-async def url_compress_menu(client, cb):
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("🟢 Higher Quality", callback_data="url_compress_high")],
-        [InlineKeyboardButton("🔴 Lower Quality", callback_data="url_compress_low")],
-        [InlineKeyboardButton("🔙 Back", callback_data="back_main")]
-    ])
-    await cb.message.edit("🗜 Compress Link - Choose mode:", reply_markup=kb)
-
-@app.on_callback_query(filters.regex("^(url_compress_high|url_compress_low)$"))
-async def url_compress_run(client, cb):
-    uid = cb.from_user.id
-    if uid not in USER_URL:
-        return await cb.answer("❌ URL expired. Send again.", show_alert=True)
-
-    url_in = USER_URL[uid]
-    status = await get_or_create_status(cb.message, uid)
-
-    async def job():
-        try:
-            USER_CANCEL.discard(uid)
-            kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_{uid}")]])
-
-            async def run():
-                await safe_edit(status, "☁️ Compressing Link using FreeConvert...", kb)
-                return await freeconvert_compress_url_return_link(url_in, status, uid)
-
-            out_url = await retry_run(run, status, uid, label="URL Compression")
-            short = await tinyurl_shorten(out_url)
-
-            await safe_edit(
-                status,
-                "✅ **Compressed Successfully ☁️**\n\n"
-                f"🌐 Input URL:\n`{url_in}`\n\n"
-                f"⬇️ **Direct Download Link:**\n`{out_url}`\n\n"
-                + (f"🔗 **Short Link:** `{short}`\n\n" if short else "")
-                + "⚠️ Link is temporary. Download quickly ✅",
-                reply_markup=kb_main_menu()
-            )
-
-        except asyncio.CancelledError:
-            await safe_edit(status, "❌ Cancelled ✅", reply_markup=kb_main_menu())
-        except Exception as e:
-            await safe_edit(status, f"❌ Failed!\n\nError: `{e}`", reply_markup=kb_main_menu())
-        finally:
-            USER_CANCEL.discard(uid)
-
-    t = asyncio.create_task(job())
-    USER_TASKS[uid] = t
-
 
 # -------------------------
 # Main
