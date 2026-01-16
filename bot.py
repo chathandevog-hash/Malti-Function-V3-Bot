@@ -2,7 +2,6 @@ import os
 import re
 import time
 import json
-import math
 import asyncio
 import aiohttp
 import humanize
@@ -14,11 +13,15 @@ from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 from config import BOT_TOKEN, API_ID, API_HASH, DOWNLOAD_DIR
 
+# ✅ Use external modules (progress supported)
+from insta import is_instagram_url, clean_insta_url, insta_download
+from youtube import is_youtube_url, clean_youtube_url, youtube_download_video
+
 # ===========================
 # LIMITS
 # ===========================
 URL_UPLOAD_LIMIT = 2 * 1024 * 1024 * 1024   # 2GB URL uploader
-COMPRESS_LIMIT = 700 * 1024 * 1024          # 700MB compressor limit
+COMPRESS_LIMIT = 700 * 1024 * 1024          # 700MB
 CHUNK_SIZE = 1024 * 256
 
 # ===========================
@@ -27,30 +30,8 @@ CHUNK_SIZE = 1024 * 256
 USER_URL = {}
 USER_TASKS = {}
 USER_CANCEL = set()
-
 USER_STATE = {}
-LAST_MEDIA = {}  # uid -> {"type","path","size","name"}
-
 UI_STATUS_MSG = {}
-
-# ===========================
-# Regex: Instagram / YouTube
-# ===========================
-INSTA_REGEX = re.compile(r"(https?://(www\.)?instagram\.com/(reel|p)/[A-Za-z0-9_\-]+)")
-YT_REGEX = re.compile(r"(https?://(www\.)?(youtube\.com|youtu\.be)/\S+)")
-
-def is_instagram_url(text: str) -> bool:
-    return bool(INSTA_REGEX.search(text or ""))
-
-def clean_insta_url(text: str) -> str:
-    m = INSTA_REGEX.search(text or "")
-    return m.group(1) if m else (text or "").strip()
-
-def is_youtube_url(text: str) -> bool:
-    return bool(YT_REGEX.search(text or ""))
-
-def clean_youtube_url(text: str) -> str:
-    return (text or "").strip().split("&")[0]
 
 # ===========================
 # Utils
@@ -92,7 +73,7 @@ def naturalsize(num_bytes: int):
         return "0 B"
     return humanize.naturalsize(num_bytes, binary=True)
 
-# ✅ Emoji color transition bar
+# ✅ Circle color bar
 def make_circle_bar(percent: float, slots: int = 14):
     percent = max(0, min(100, percent))
     filled = int((percent / 100) * slots)
@@ -132,9 +113,6 @@ async def safe_edit(msg, text, reply_markup=None):
     except:
         pass
 
-def busy(uid: int) -> bool:
-    return uid in USER_TASKS and not USER_TASKS[uid].done()
-
 async def get_or_create_status(message, uid):
     if uid in UI_STATUS_MSG:
         return UI_STATUS_MSG[uid]
@@ -150,7 +128,7 @@ def clean_file(p):
             pass
 
 # ===========================
-# Video meta + thumbnail
+# Thumbnail (middle frame)
 # ===========================
 def get_video_meta(path: str):
     try:
@@ -190,26 +168,6 @@ async def gen_thumbnail(input_path: str, out_thumb: str):
     )
     await proc.wait()
     return os.path.exists(out_thumb)
-
-# ===========================
-# Telegram download progress
-# ===========================
-async def tg_download_progress(current, total, status_msg, uid, start_time):
-    if uid in USER_CANCEL:
-        raise asyncio.CancelledError
-
-    elapsed = time.time() - start_time
-    speed = current / elapsed if elapsed > 0 else 0
-    eta = (total - current) / speed if speed > 0 else 0
-
-    now = time.time()
-    if not hasattr(status_msg, "_last_edit"):
-        status_msg._last_edit = 0
-
-    if now - status_msg._last_edit > 2.0:
-        status_msg._last_edit = now
-        kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_{uid}")]])
-        await safe_edit(status_msg, make_progress_text("⬇️ Downloading", current, total, speed, eta), kb)
 
 # ===========================
 # URL download stream
@@ -299,112 +257,6 @@ async def upload_progress(current, total, status_msg, uid, start_time):
         await safe_edit(status_msg, make_progress_text("📤 Uploading", current, total, speed, eta), kb)
 
 # ===========================
-# Instagram downloader (yt-dlp)
-# ===========================
-async def insta_download(url: str, uid: int, status_msg=None):
-    os.makedirs(DOWNLOAD_DIR, exist_ok=True)
-    url = clean_insta_url(url)
-
-    outtmpl = os.path.join(DOWNLOAD_DIR, f"insta_{uid}_{int(time.time())}.%(ext)s")
-
-    cmd = [
-        "yt-dlp",
-        "--no-playlist",
-        "--no-warnings",
-        "--socket-timeout", "30",
-        "--retries", "5",
-        "-f", "bv*+ba/best",
-        "--merge-output-format", "mp4",
-        "-o", outtmpl,
-        url
-    ]
-
-    if status_msg:
-        await safe_edit(status_msg, "📥 Downloading Instagram Reel...\n⏳ Please wait...")
-
-    proc = await asyncio.create_subprocess_exec(
-        *cmd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE
-    )
-
-    stdout, stderr = await proc.communicate()
-    if proc.returncode != 0:
-        err = (stderr.decode(errors="ignore") or stdout.decode(errors="ignore"))[:350]
-        raise Exception(f"Insta download failed: {err}")
-
-    mp4_path = outtmpl.replace("%(ext)s", "mp4")
-    if os.path.exists(mp4_path):
-        return mp4_path
-
-    files = [f for f in os.listdir(DOWNLOAD_DIR) if f.startswith(f"insta_{uid}_") and f.endswith(".mp4")]
-    if not files:
-        raise Exception("Downloaded MP4 not found.")
-    files.sort(key=lambda x: os.path.getmtime(os.path.join(DOWNLOAD_DIR, x)), reverse=True)
-    return os.path.join(DOWNLOAD_DIR, files[0])
-
-# ===========================
-# YouTube downloader system
-# ===========================
-YT_QUALITIES = ["1080p", "720p", "360p"]
-
-async def yt_download(url: str, uid: int, quality: str, status_msg=None):
-    """
-    Download YouTube video with selected quality using yt-dlp.
-    """
-    os.makedirs(DOWNLOAD_DIR, exist_ok=True)
-    url = clean_youtube_url(url)
-
-    outtmpl = os.path.join(DOWNLOAD_DIR, f"yt_{uid}_{int(time.time())}.%(ext)s")
-
-    # format mapping
-    if quality == "1080p":
-        fmt = "bestvideo[height<=1080]+bestaudio/best[height<=1080]"
-    elif quality == "720p":
-        fmt = "bestvideo[height<=720]+bestaudio/best[height<=720]"
-    else:
-        fmt = "bestvideo[height<=360]+bestaudio/best[height<=360]"
-
-    cmd = [
-        "yt-dlp",
-        "--no-playlist",
-        "--no-warnings",
-        "--socket-timeout", "30",
-        "--retries", "5",
-        "-f", fmt,
-        "--merge-output-format", "mp4",
-        "-o", outtmpl,
-        url
-    ]
-
-    if status_msg:
-        await safe_edit(status_msg, f"📥 Downloading YouTube ({quality})...\n⏳ Please wait...")
-
-    proc = await asyncio.create_subprocess_exec(
-        *cmd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE
-    )
-
-    stdout, stderr = await proc.communicate()
-    if proc.returncode != 0:
-        err = (stderr.decode(errors="ignore") or stdout.decode(errors="ignore"))[:400]
-        # clean message for private/restricted
-        if "private" in err.lower() or "sign in" in err.lower() or "restricted" in err.lower():
-            raise Exception("YouTube video is private / restricted / blocked. Try another link.")
-        raise Exception(f"YouTube download failed: {err}")
-
-    mp4_path = outtmpl.replace("%(ext)s", "mp4")
-    if os.path.exists(mp4_path):
-        return mp4_path
-
-    files = [f for f in os.listdir(DOWNLOAD_DIR) if f.startswith(f"yt_{uid}_") and f.endswith(".mp4")]
-    if not files:
-        raise Exception("Downloaded MP4 not found.")
-    files.sort(key=lambda x: os.path.getmtime(os.path.join(DOWNLOAD_DIR, x)), reverse=True)
-    return os.path.join(DOWNLOAD_DIR, files[0])
-
-# ===========================
 # UI Keyboards
 # ===========================
 def main_menu_keyboard():
@@ -471,12 +323,6 @@ async def menu_insta(client, cb):
     await cb.answer()
     await cb.message.edit("📸 **Instagram Mode**\n\nSend Reel URL 👇", reply_markup=back_keyboard())
 
-@app.on_callback_query(filters.regex("^menu_compress$"))
-async def menu_compress(client, cb):
-    USER_STATE[cb.from_user.id] = "WAIT_MEDIA_COMPRESS"
-    await cb.answer()
-    await cb.message.edit("🗜️ **Compressor Mode**\n\nSend a video/file 👇", reply_markup=back_keyboard())
-
 @app.on_callback_query(filters.regex("^menu_youtube$"))
 async def menu_youtube(client, cb):
     USER_STATE[cb.from_user.id] = "WAIT_YOUTUBE"
@@ -515,7 +361,7 @@ async def text_handler(client, message):
     if text.startswith("/"):
         return
 
-    # Auto detect Instagram
+    # Instagram detect
     if is_instagram_url(text):
         USER_URL[uid] = clean_insta_url(text)
         kb = InlineKeyboardMarkup([
@@ -527,7 +373,7 @@ async def text_handler(client, message):
         ])
         return await message.reply("✅ Instagram Reel Detected 📸\n\n👇 Select format:", reply_markup=kb)
 
-    # Auto detect YouTube
+    # YouTube detect
     if is_youtube_url(text):
         USER_URL[uid] = clean_youtube_url(text)
         kb = InlineKeyboardMarkup([
@@ -538,27 +384,16 @@ async def text_handler(client, message):
         ])
         return await message.reply("✅ YouTube Link Detected ▶️\n\nSelect quality:", reply_markup=kb)
 
+    # URL uploader state
     state = USER_STATE.get(uid, "")
-
     if state == "WAIT_URL" and is_url(text):
         USER_URL[uid] = text
         kb = InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton("🎥 Video Upload", callback_data="send_video"),
-                InlineKeyboardButton("📁 File Upload", callback_data="send_file")
-            ],
+            [InlineKeyboardButton("🎥 Video Upload", callback_data="send_video"),
+             InlineKeyboardButton("📁 File Upload", callback_data="send_file")],
             [InlineKeyboardButton("⬅️ Back", callback_data="back_main")]
         ])
         return await message.reply("✅ URL Received!\n\n👇 Select upload type:", reply_markup=kb)
-
-    if state == "WAIT_INSTA":
-        return await message.reply("❌ Please send Instagram reel URL.")
-
-    if state == "WAIT_YOUTUBE":
-        return await message.reply("❌ Please send valid YouTube URL.")
-
-    if state == "WAIT_URL":
-        return await message.reply("❌ Please send direct URL (http/https).")
 
     return
 
@@ -584,7 +419,8 @@ async def insta_send(client, cb):
             USER_CANCEL.discard(uid)
             kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_{uid}")]])
 
-            await safe_edit(status, "📥 Downloading Instagram reel...\n⏳ Please wait...", kb)
+            # ✅ REAL processing now (insta.py)
+            await safe_edit(status, "📥 Instagram downloading...\n⏳ Please wait...", kb)
             file_path = await insta_download(url, uid, status_msg=status)
 
             if uid in USER_CANCEL:
@@ -593,16 +429,16 @@ async def insta_send(client, cb):
             size = os.path.getsize(file_path)
             name = clean_display_name(os.path.basename(file_path))
 
+            thumb = os.path.splitext(file_path)[0] + "_thumb.jpg"
+            try:
+                await gen_thumbnail(file_path, thumb)
+            except:
+                thumb = None
+
+            up_start = time.time()
+            await safe_edit(status, "📤 Uploading...", kb)
+
             if mode == "video":
-                thumb = os.path.splitext(file_path)[0] + "_thumb.jpg"
-                try:
-                    await gen_thumbnail(file_path, thumb)
-                except:
-                    thumb = None
-
-                up_start = time.time()
-                await safe_edit(status, "📤 Uploading...", kb)
-
                 await client.send_video(
                     chat_id=cb.message.chat.id,
                     video=file_path,
@@ -613,9 +449,6 @@ async def insta_send(client, cb):
                     progress_args=(status, uid, up_start)
                 )
             else:
-                up_start = time.time()
-                await safe_edit(status, "📤 Uploading...", kb)
-
                 await client.send_document(
                     chat_id=cb.message.chat.id,
                     document=file_path,
@@ -636,8 +469,7 @@ async def insta_send(client, cb):
             clean_file(file_path)
             USER_CANCEL.discard(uid)
 
-    t = asyncio.create_task(job())
-    USER_TASKS[uid] = t
+    USER_TASKS[uid] = asyncio.create_task(job())
 
 # ===========================
 # YouTube callbacks
@@ -661,8 +493,8 @@ async def youtube_cb(client, cb):
             USER_CANCEL.discard(uid)
             kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_{uid}")]])
 
-            await safe_edit(status, f"📥 Downloading YouTube ({quality})...\n⏳ Please wait...", kb)
-            file_path = await yt_download(url, uid, quality, status_msg=status)
+            # ✅ REAL processing now (youtube.py updated)
+            file_path = await youtube_download_video(url, uid, quality, status_msg=status)
 
             if uid in USER_CANCEL:
                 raise asyncio.CancelledError
@@ -701,8 +533,7 @@ async def youtube_cb(client, cb):
             clean_file(file_path)
             USER_CANCEL.discard(uid)
 
-    t = asyncio.create_task(job())
-    USER_TASKS[uid] = t
+    USER_TASKS[uid] = asyncio.create_task(job())
 
 # ===========================
 # URL Upload Callback
@@ -737,6 +568,7 @@ async def send_url_upload(client, cb):
                 raise asyncio.CancelledError
 
             size = os.path.getsize(file_path)
+            kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel Upload", callback_data=f"cancel_{uid}")]])
 
             if mode == "video":
                 thumb = os.path.splitext(file_path)[0] + "_thumb.jpg"
@@ -746,7 +578,6 @@ async def send_url_upload(client, cb):
                     thumb = None
 
                 up_start = time.time()
-                kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel Upload", callback_data=f"cancel_{uid}")]])
                 await safe_edit(status, "📤 Uploading...", kb)
 
                 await client.send_video(
@@ -760,7 +591,6 @@ async def send_url_upload(client, cb):
                 )
             else:
                 up_start = time.time()
-                kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel Upload", callback_data=f"cancel_{uid}")]])
                 await safe_edit(status, "📤 Uploading...", kb)
 
                 await client.send_document(
@@ -783,8 +613,7 @@ async def send_url_upload(client, cb):
             clean_file(file_path)
             USER_CANCEL.discard(uid)
 
-    t = asyncio.create_task(job())
-    USER_TASKS[uid] = t
+    USER_TASKS[uid] = asyncio.create_task(job())
 
 # ===========================
 # RUN
