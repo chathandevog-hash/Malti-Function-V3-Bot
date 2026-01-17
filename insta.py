@@ -5,12 +5,13 @@ import json
 import asyncio
 import subprocess
 
-from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, InputMediaPhoto, InputMediaVideo
 from pyrogram.errors import FloodWait
 
 DOWNLOAD_DIR = os.getenv("DOWNLOAD_DIR", "downloads")
 
-INSTA_REGEX = re.compile(r"(https?://(www\.)?instagram\.com/(reel|p)/[A-Za-z0-9_\-]+)")
+# ✅ support reel + post + tv
+INSTA_REGEX = re.compile(r"(https?://(www\.)?instagram\.com/(reel|p|tv)/[A-Za-z0-9_\-]+)")
 
 try:
     from bot import USER_CANCEL
@@ -18,6 +19,9 @@ except:
     USER_CANCEL = set()
 
 
+# ===============================
+# URL HELPERS
+# ===============================
 def is_instagram_url(text: str) -> bool:
     return bool(INSTA_REGEX.search(text or ""))
 
@@ -54,6 +58,49 @@ async def safe_edit(msg, text, reply_markup=None):
 
 
 # ===============================
+# UI + PROGRESS
+# ===============================
+def fancy_bar(step: int):
+    bars = [
+        "⚪⚪⚪⚪⚪⚪⚪⚪⚪⚪⚪⚪⚪⚪",
+        "🔴🔴⚪⚪⚪⚪⚪⚪⚪⚪⚪⚪⚪⚪",
+        "🟠🟠🟠🟠⚪⚪⚪⚪⚪⚪⚪⚪⚪⚪",
+        "🟡🟡🟡🟡🟡🟡⚪⚪⚪⚪⚪⚪⚪⚪",
+        "🟢🟢🟢🟢🟢🟢🟢🟢⚪⚪⚪⚪⚪⚪",
+        "✅✅✅✅✅✅✅✅✅✅✅✅✅✅",
+    ]
+    return bars[step % len(bars)]
+
+
+async def progress_animator(uid: int, status_msg, header: str, label: str):
+    """
+    ✅ safe edit interval (avoid FloodWait)
+    """
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_{uid}")]])
+    step = 0
+    last_edit = 0
+
+    while True:
+        if uid in USER_CANCEL:
+            return
+
+        now = time.time()
+        if now - last_edit >= 11:
+            last_edit = now
+            step += 1
+            await safe_edit(
+                status_msg,
+                f"{header}\n\n"
+                f"⚙️ {label}\n\n"
+                f"{fancy_bar(step)}\n\n"
+                f"⏳ Please wait...",
+                reply_markup=kb
+            )
+
+        await asyncio.sleep(1.0)
+
+
+# ===============================
 # ffprobe metadata
 # ===============================
 def ffprobe_info(path: str):
@@ -78,9 +125,6 @@ def ffprobe_info(path: str):
         return {"duration": 0, "width": 0, "height": 0}
 
 
-# ===============================
-# middle thumbnail
-# ===============================
 def make_thumb(video_path: str):
     info = ffprobe_info(video_path)
     duration = info.get("duration", 0) or 0
@@ -106,69 +150,33 @@ def make_thumb(video_path: str):
 
 
 # ===============================
-# Fancy bar
-# ===============================
-def fancy_bar(step: int):
-    bars = [
-        "⚪⚪⚪⚪⚪⚪⚪⚪⚪⚪⚪⚪⚪⚪",
-        "🔴🔴⚪⚪⚪⚪⚪⚪⚪⚪⚪⚪⚪⚪",
-        "🟠🟠🟠🟠⚪⚪⚪⚪⚪⚪⚪⚪⚪⚪",
-        "🟡🟡🟡🟡🟡🟡⚪⚪⚪⚪⚪⚪⚪⚪",
-        "🟢🟢🟢🟢🟢🟢🟢🟢⚪⚪⚪⚪⚪⚪",
-        "✅✅✅✅✅✅✅✅✅✅✅✅✅✅",
-    ]
-    return bars[step % len(bars)]
-
-
-# ===============================
-# Progress Animator (FLOODSAFE) ✅
-# ===============================
-async def progress_animator(uid: int, status_msg, label: str):
-    """
-    Old version edited every 2.3s -> FloodWait.
-    ✅ Now edits every 10-12s (safe) so progress always visible.
-    """
-    kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_{uid}")]])
-    step = 0
-    last_edit = 0
-
-    while True:
-        if uid in USER_CANCEL:
-            return
-
-        now = time.time()
-        if now - last_edit >= 11:  # ✅ floodwait safe
-            last_edit = now
-            step += 1
-            await safe_edit(
-                status_msg,
-                f"📥 Instagram Reel Detected ✅\n\n"
-                f"⚙️ {label}\n\n"
-                f"{fancy_bar(step)}\n\n"
-                f"⏳ Please wait...",
-                reply_markup=kb
-            )
-
-        await asyncio.sleep(1.0)
-
-
-# ===============================
-# yt-dlp download
+# yt-dlp download (FASTER) ✅
 # ===============================
 async def insta_download(url: str, uid: int):
+    """
+    ✅ supports reel + post + carousel
+    ✅ tries best speed settings
+    """
     os.makedirs(DOWNLOAD_DIR, exist_ok=True)
     url = clean_insta_url(url)
 
-    outtmpl = os.path.join(DOWNLOAD_DIR, f"insta_{uid}_{int(time.time())}.%(ext)s")
+    # save in per-user folder
+    user_dir = os.path.join(DOWNLOAD_DIR, f"insta_{uid}")
+    os.makedirs(user_dir, exist_ok=True)
+
+    outtmpl = os.path.join(user_dir, f"%(title).80s_{uid}_{int(time.time())}.%(ext)s")
 
     cmd = [
         "yt-dlp",
-        "--no-playlist",
         "--no-warnings",
-        "--socket-timeout", "30",
-        "--retries", "10",
-        "-f", "bv*+ba/best",
-        "--merge-output-format", "mp4",
+        "--no-playlist",  # ig single post is okay (carousel still extracted)
+        "--socket-timeout", "25",
+        "--retries", "6",
+        "--concurrent-fragments", "8",  # ✅ faster downloads
+        "--fragment-retries", "6",
+        "--force-overwrites",
+        "--restrict-filenames",
+        "-f", "bv*+ba/b/best",
         "-o", outtmpl,
         url
     ]
@@ -179,6 +187,7 @@ async def insta_download(url: str, uid: int):
         stderr=asyncio.subprocess.STDOUT
     )
 
+    # wait for finish
     while True:
         if uid in USER_CANCEL:
             try:
@@ -196,15 +205,69 @@ async def insta_download(url: str, uid: int):
     if proc.returncode != 0:
         raise Exception("Insta download failed")
 
-    mp4_path = outtmpl.replace("%(ext)s", "mp4")
-    if os.path.exists(mp4_path):
-        return mp4_path
+    # collect files from folder
+    files = []
+    for f in os.listdir(user_dir):
+        p = os.path.join(user_dir, f)
+        if os.path.isfile(p) and os.path.getsize(p) > 1000:
+            if p.lower().endswith((".mp4", ".mkv", ".webm", ".jpg", ".jpeg", ".png")):
+                files.append(p)
 
-    files = [f for f in os.listdir(DOWNLOAD_DIR) if f.startswith(f"insta_{uid}_") and f.endswith(".mp4")]
     if not files:
-        raise Exception("Downloaded mp4 not found")
-    files.sort(key=lambda x: os.path.getmtime(os.path.join(DOWNLOAD_DIR, x)), reverse=True)
-    return os.path.join(DOWNLOAD_DIR, files[0])
+        raise Exception("Downloaded file not found")
+
+    # newest first
+    files.sort(key=lambda x: os.path.getmtime(x), reverse=True)
+    return files
+
+
+# =========================
+# SEND OUTPUT (POST/REEL/CAROUSEL)
+# =========================
+async def send_insta_files(client, chat_id: int, files: list, caption: str):
+    """
+    ✅ If multiple files -> media group
+    ✅ If single -> send photo/video
+    """
+    if not files:
+        return
+
+    # prefer to send max 10 in album
+    if len(files) > 1:
+        medias = []
+        for p in files[:10]:
+            if p.lower().endswith((".jpg", ".jpeg", ".png")):
+                medias.append(InputMediaPhoto(media=p))
+            else:
+                medias.append(InputMediaVideo(media=p, supports_streaming=True))
+        # put caption only on first
+        if medias:
+            medias[0].caption = caption
+        await client.send_media_group(chat_id=chat_id, media=medias)
+        return
+
+    p = files[0]
+    if p.lower().endswith((".jpg", ".jpeg", ".png")):
+        await client.send_photo(chat_id=chat_id, photo=p, caption=caption)
+    else:
+        thumb = make_thumb(p)
+        info = ffprobe_info(p)
+        args = {}
+        if info.get("duration", 0) > 0:
+            args["duration"] = int(info["duration"])
+        if info.get("width", 0) > 0:
+            args["width"] = int(info["width"])
+        if info.get("height", 0) > 0:
+            args["height"] = int(info["height"])
+
+        await client.send_video(
+            chat_id=chat_id,
+            video=p,
+            caption=caption,
+            supports_streaming=True,
+            thumb=thumb if thumb and os.path.exists(thumb) else None,
+            **args
+        )
 
 
 # =========================
@@ -212,45 +275,39 @@ async def insta_download(url: str, uid: int):
 # =========================
 async def insta_entry(client, message, url: str, USER_TASKS, main_menu_keyboard):
     uid = message.from_user.id
+    url = clean_insta_url(url)
 
-    status = await safe_send(message, "📥 Instagram Reel Detected ✅\n\n⏳ Starting...")
+    header = "📸 Instagram Detected ✅"
+    if "/reel/" in url:
+        header = "📥 Instagram Reel Detected ✅"
+    elif "/p/" in url:
+        header = "🖼️ Instagram Post Detected ✅"
+    elif "/tv/" in url:
+        header = "🎞️ Instagram TV Detected ✅"
+
+    status = await safe_send(message, f"{header}\n\n⏳ Starting...")
     if not status:
         return
 
     async def job():
-        file_path = None
-        thumb_path = None
+        files = []
         anim_task = None
         try:
             USER_CANCEL.discard(uid)
 
-            anim_task = asyncio.create_task(progress_animator(uid, status, "Downloading reel..."))
-            file_path = await insta_download(url, uid)
+            anim_task = asyncio.create_task(progress_animator(uid, status, header, "Downloading..."))
+            files = await insta_download(url, uid)
 
             if anim_task and not anim_task.done():
                 anim_task.cancel()
 
-            anim_task = asyncio.create_task(progress_animator(uid, status, "Uploading reel..."))
+            anim_task = asyncio.create_task(progress_animator(uid, status, header, "Uploading..."))
 
-            thumb_path = make_thumb(file_path)
-            info = ffprobe_info(file_path)
-
-            # ✅ do NOT send 0 values
-            args = {}
-            if info.get("duration", 0) > 0:
-                args["duration"] = int(info["duration"])
-            if info.get("width", 0) > 0:
-                args["width"] = int(info["width"])
-            if info.get("height", 0) > 0:
-                args["height"] = int(info["height"])
-
-            await client.send_video(
-                chat_id=message.chat.id,
-                video=file_path,
-                caption="✅ Instagram Reel 🎥",
-                supports_streaming=True,
-                thumb=thumb_path if thumb_path and os.path.exists(thumb_path) else None,
-                **args
+            await send_insta_files(
+                client,
+                message.chat.id,
+                files,
+                caption="✅ Instagram Download Complete 🎉"
             )
 
             if anim_task and not anim_task.done():
@@ -277,20 +334,30 @@ async def insta_entry(client, message, url: str, USER_TASKS, main_menu_keyboard)
         finally:
             USER_CANCEL.discard(uid)
 
+            # cleanup files
             try:
-                if anim_task and not anim_task.done():
-                    anim_task.cancel()
+                for p in files:
+                    if p and os.path.exists(p):
+                        os.remove(p)
+            except:
+                pass
+
+            # cleanup folder
+            try:
+                user_dir = os.path.join(DOWNLOAD_DIR, f"insta_{uid}")
+                if os.path.isdir(user_dir):
+                    for f in os.listdir(user_dir):
+                        fp = os.path.join(user_dir, f)
+                        try:
+                            os.remove(fp)
+                        except:
+                            pass
             except:
                 pass
 
             try:
-                if file_path and os.path.exists(file_path):
-                    os.remove(file_path)
-            except:
-                pass
-            try:
-                if thumb_path and os.path.exists(thumb_path):
-                    os.remove(thumb_path)
+                if anim_task and not anim_task.done():
+                    anim_task.cancel()
             except:
                 pass
 
