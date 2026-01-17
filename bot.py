@@ -7,11 +7,14 @@ from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 from config import BOT_TOKEN, API_ID, API_HASH, DOWNLOAD_DIR
 
-# ✅ Modules (your real functions)
+# ✅ Modules
 from url import is_url, url_flow, url_callback_router
 from compress import compressor_entry, compressor_callback_router
 from insta import is_instagram_url, clean_insta_url, insta_entry
 from youtube import is_youtube_url, clean_youtube_url, youtube_entry, youtube_callback_router
+
+# ✅ NEW: Terabox module
+from terabox import is_terabox_url, terabox_entry
 
 
 # ===========================
@@ -27,6 +30,7 @@ UI_STATUS_MSG = {}
 # HELPERS
 # ===========================
 async def get_or_create_status(message, uid):
+    # ✅ always re-use one status msg per user (prevents flood)
     if uid in UI_STATUS_MSG:
         return UI_STATUS_MSG[uid]
     status = await message.reply("⏳ Processing...")
@@ -43,6 +47,9 @@ def main_menu_keyboard():
         [
             InlineKeyboardButton("📸 Instagram", callback_data="menu_insta"),
             InlineKeyboardButton("▶️ YouTube", callback_data="menu_youtube")
+        ],
+        [
+            InlineKeyboardButton("📦 Terabox", callback_data="menu_terabox")
         ]
     ])
 
@@ -62,6 +69,8 @@ WELCOME_TEXT = (
     "➜ Send Reel link ✅\n\n"
     "▶️ **YouTube Downloader**\n"
     "➜ Send link ➜ Choose Video/File/Audio ➜ Select Quality ✅\n\n"
+    "📦 **Terabox Downloader**\n"
+    "➜ Send Terabox link ➜ Processing ➜ Video ✅\n\n"
     "🚀 Now send something to start 👇😊"
 )
 
@@ -126,6 +135,13 @@ async def menu_youtube(client, cb):
     await cb.message.edit("▶️ **YouTube Mode**\n\nSend YouTube URL 👇", reply_markup=back_keyboard())
 
 
+@app.on_callback_query(filters.regex("^menu_terabox$"))
+async def menu_terabox(client, cb):
+    USER_STATE[cb.from_user.id] = "WAIT_TERABOX"
+    await cb.answer()
+    await cb.message.edit("📦 **Terabox Mode**\n\nSend Terabox Link 👇", reply_markup=back_keyboard())
+
+
 # ===========================
 # CANCEL
 # ===========================
@@ -177,7 +193,6 @@ async def all_callbacks(client, cb):
             client, cb, USER_TASKS, USER_CANCEL, get_or_create_status, main_menu_keyboard, DOWNLOAD_DIR
         )
 
-    # other
     try:
         await cb.answer("✅", show_alert=False)
     except:
@@ -194,6 +209,10 @@ async def text_handler(client, message):
 
     if text.startswith("/"):
         return
+
+    # ✅ Terabox auto
+    if is_terabox_url(text):
+        return await terabox_entry(client, message, text, USER_TASKS, main_menu_keyboard)
 
     # ✅ Insta auto
     if is_instagram_url(text):
@@ -212,6 +231,22 @@ async def text_handler(client, message):
 
     if state == "WAIT_URL":
         return await url_flow(client, message, text)
+
+    if state == "WAIT_TERABOX":
+        # if user selected terabox menu but pasted link
+        if is_terabox_url(text):
+            return await terabox_entry(client, message, text, USER_TASKS, main_menu_keyboard)
+        return await message.reply("❌ Terabox link ayakku bro ✅", reply_markup=back_keyboard())
+
+    if state == "WAIT_INSTA":
+        if is_instagram_url(text):
+            return await insta_entry(client, message, clean_insta_url(text), USER_TASKS, main_menu_keyboard)
+        return await message.reply("❌ Instagram Reel link ayakku ✅", reply_markup=back_keyboard())
+
+    if state == "WAIT_YOUTUBE":
+        if is_youtube_url(text):
+            return await youtube_entry(client, message, clean_youtube_url(text))
+        return await message.reply("❌ YouTube link ayakku ✅", reply_markup=back_keyboard())
 
     await message.reply("❌ Menu select cheyyu ✅", reply_markup=main_menu_keyboard())
 
