@@ -10,9 +10,11 @@ from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 DOWNLOAD_DIR = os.getenv("DOWNLOAD_DIR", "downloads")
 CLOUDCONVERT_API_BASE = "https://api.cloudconvert.com/v2"
 
+# ✅ QUALITIES
 HIGH_QUALITIES = ["1080p", "720p", "480p"]
 LOW_QUALITIES = ["360p", "240p", "144p"]
 
+# ✅ state
 COMPRESS_STATE = {}  # uid -> {"msg_id": int, "mode": str}
 
 
@@ -28,7 +30,7 @@ async def safe_edit(msg, text, reply_markup=None):
 
 def naturalsize(b: int):
     try:
-        return humanize.naturalsize(b, binary=True)
+        return humanize.naturalsize(int(b), binary=True)
     except:
         return str(b)
 
@@ -56,7 +58,7 @@ def make_circle_bar(percent: float, slots: int = 14):
 def make_progress_text(title, current, total, speed, eta):
     percent = (current / total * 100) if total else 0
     bar = make_circle_bar(percent)
-    speed_str = naturalsize(int(speed)) + "/s" if speed else "0 B/s"
+    speed_str = naturalsize(speed) + "/s" if speed else "0 B/s"
 
     return (
         f"✨ **{title}**\n\n"
@@ -93,6 +95,7 @@ def quality_kb(mode: str):
             row = []
     if row:
         rows.append(row)
+
     rows.append([InlineKeyboardButton("⬅️ Back", callback_data="cmp_back_menu")])
     return InlineKeyboardMarkup(rows)
 
@@ -112,7 +115,8 @@ async def tg_download_progress(current, total, status_msg, uid, start_time, USER
     if not hasattr(status_msg, "_last_edit"):
         status_msg._last_edit = 0
 
-    if now - status_msg._last_edit > 2:
+    # ✅ floodwait safe
+    if now - status_msg._last_edit > 6:
         status_msg._last_edit = now
         kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_{uid}")]])
         await safe_edit(
@@ -123,7 +127,7 @@ async def tg_download_progress(current, total, status_msg, uid, start_time, USER
 
 
 # ==========================
-# CLOUDCONVERT
+# CLOUDCONVERT HELPERS
 # ==========================
 async def cloudconvert_create_job(session: aiohttp.ClientSession, api_key: str, quality: str):
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
@@ -134,7 +138,7 @@ async def cloudconvert_create_job(session: aiohttp.ClientSession, api_key: str, 
     }
     height = height_map.get(quality, 360)
 
-    # ✅ FIXED: remove unsupported "engine"
+    # ✅ IMPORTANT: no "engine" field (CloudConvert rejects it)
     payload = {
         "tasks": {
             "import-1": {"operation": "import/upload"},
@@ -213,32 +217,35 @@ async def cloudconvert_wait(session: aiohttp.ClientSession, api_key: str, job_id
         finished = len([t for t in tasks if t.get("status") == "finished"])
         pct = (finished / total) * 100
 
-        if time.time() - last_edit > 2:
+        # ✅ floodwait safe
+        if time.time() - last_edit > 6:
             last_edit = time.time()
             kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_{uid}")]])
             await safe_edit(
                 status_msg,
-                f"⚙️ **Compressing in cloud...**\n\n{make_circle_bar(pct)}\n\n📊 **{pct:.2f}%**",
+                f"⚙️ **Compressing in Cloud...**\n\n{make_circle_bar(pct)}\n\n📊 **{pct:.2f}%**",
                 kb
             )
 
         if job_json.get("data", {}).get("status") == "finished":
             return job_json
+
         if job_json.get("data", {}).get("status") == "error":
             raise Exception("CloudConvert job failed")
 
-        await asyncio.sleep(2)
+        await asyncio.sleep(3)
 
 
 # ==========================
-# ENTRY + CALLBACKS
+# ENTRY + CALLBACK ROUTER (for bot.py)
 # ==========================
 async def compressor_entry(client, message):
     uid = message.from_user.id
     media = message.video or message.document
     if not media:
-        return await message.reply("❌ Send a video or file.")
+        return await message.reply("❌ Send Video/File only.")
 
+    # save msg id
     COMPRESS_STATE[uid] = {"msg_id": message.id}
 
     await message.reply(
@@ -252,11 +259,9 @@ async def compressor_callback_router(client, cb, USER_TASKS, USER_CANCEL, get_or
     data = cb.data
 
     if data == "cmp_back_menu":
-        await cb.answer()
         return await cb.message.edit("🗜️ Choose mode 👇", reply_markup=compressor_menu_kb())
 
     if data in ["cmp_high", "cmp_low"]:
-        await cb.answer()
         mode = "high" if data == "cmp_high" else "low"
         st = COMPRESS_STATE.get(uid) or {}
         st["mode"] = mode
@@ -268,7 +273,6 @@ async def compressor_callback_router(client, cb, USER_TASKS, USER_CANCEL, get_or
         )
 
     if data.startswith("cmp_q_"):
-        await cb.answer()
         quality = data.replace("cmp_q_", "")
         st = COMPRESS_STATE.get(uid) or {}
         msg_id = st.get("msg_id")
@@ -278,7 +282,6 @@ async def compressor_callback_router(client, cb, USER_TASKS, USER_CANCEL, get_or
 
         status = await get_or_create_status(cb.message, uid)
         kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_{uid}")]])
-        await safe_edit(status, f"⚙️ Starting compress ({quality})...", kb)
 
         async def job():
             input_path = None
@@ -295,11 +298,14 @@ async def compressor_callback_router(client, cb, USER_TASKS, USER_CANCEL, get_or
                     raise Exception("Media not found")
 
                 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
-                input_path = os.path.join(DOWNLOAD_DIR, f"cmp_{uid}_{int(time.time())}_{media.file_unique_id}.bin")
+                input_path = os.path.join(
+                    DOWNLOAD_DIR,
+                    f"cmp_{uid}_{int(time.time())}_{media.file_unique_id}.bin"
+                )
 
-                # ✅ Telegram download with progress bar
                 await safe_edit(status, "⬇️ Downloading from Telegram...", kb)
                 dl_start = time.time()
+
                 await client.download_media(
                     media_msg,
                     file_name=input_path,
@@ -307,7 +313,7 @@ async def compressor_callback_router(client, cb, USER_TASKS, USER_CANCEL, get_or
                     progress_args=(status, uid, dl_start, USER_CANCEL)
                 )
 
-                await safe_edit(status, "☁️ Creating cloud job...", kb)
+                await safe_edit(status, f"☁️ Creating Cloud Job ({quality})...", kb)
 
                 timeout = aiohttp.ClientTimeout(total=None)
                 async with aiohttp.ClientSession(timeout=timeout) as session:
@@ -318,7 +324,7 @@ async def compressor_callback_router(client, cb, USER_TASKS, USER_CANCEL, get_or
                     if not upload_form:
                         raise Exception("Upload form missing")
 
-                    await safe_edit(status, "☁️ Uploading to cloud...", kb)
+                    await safe_edit(status, "☁️ Uploading to Cloud...", kb)
                     await cloudconvert_upload(session, upload_form, input_path)
 
                     await safe_edit(status, "⚙️ Compressing...", kb)
@@ -328,19 +334,20 @@ async def compressor_callback_router(client, cb, USER_TASKS, USER_CANCEL, get_or
                     if not out_url:
                         raise Exception("Output link missing")
 
+                # ✅ OUTPUT ONLY LINK (Mode A)
                 await safe_edit(
                     status,
                     f"✅ **Compressed Successfully ☁️**\n\n"
                     f"🎞 Quality: **{quality}**\n"
                     f"⬇️ Download Link:\n{out_url}\n\n"
-                    f"📌 Tip: Paste this link in 🌐 URL Uploader to upload to Telegram ✅",
+                    f"📌 (You can paste this link in URL Uploader to upload to Telegram ✅)",
                     reply_markup=main_menu_keyboard()
                 )
 
             except asyncio.CancelledError:
                 await safe_edit(status, "❌ Cancelled ✅", reply_markup=main_menu_keyboard())
             except Exception as e:
-                await safe_edit(status, f"❌ Failed!\n\nError: `{e}`", reply_markup=main_menu_keyboard())
+                await safe_edit(status, f"❌ Compress Failed!\n\nError: `{e}`", reply_markup=main_menu_keyboard())
             finally:
                 USER_CANCEL.discard(uid)
                 COMPRESS_STATE.pop(uid, None)
