@@ -24,12 +24,14 @@ CHUNK_SIZE = 1024 * 256
 def is_url(text: str):
     return (text or "").startswith("http://") or (text or "").startswith("https://")
 
+
 def naturalsize(num_bytes: int):
     if num_bytes is None:
         return "Unknown"
     if num_bytes <= 0:
         return "0 B"
     return humanize.naturalsize(num_bytes, binary=True)
+
 
 def safe_filename(name: str):
     name = re.sub(r"[\\/:*?\"<>|]", "_", name)
@@ -38,6 +40,7 @@ def safe_filename(name: str):
         name = f"file_{int(time.time())}"
     return name[:180]
 
+
 def clean_display_name(name: str):
     base = os.path.splitext(name)[0]
     base = unquote(base)
@@ -45,6 +48,7 @@ def clean_display_name(name: str):
     if len(base) > 60:
         base = base[:60].rstrip("_")
     return base or f"file_{int(time.time())}"
+
 
 def format_time(seconds: float):
     if seconds <= 0:
@@ -57,6 +61,7 @@ def format_time(seconds: float):
     if m:
         return f"{m}m {s}s"
     return f"{s}s"
+
 
 def make_circle_bar(percent: float, slots: int = 14):
     percent = max(0, min(100, percent))
@@ -77,6 +82,7 @@ def make_circle_bar(percent: float, slots: int = 14):
 
     return f"[{icon * filled}{'⚪' * (slots - filled)}]"
 
+
 def make_progress_text(title, done, total, speed, eta):
     percent = (done / total * 100) if total else 0
     bar = make_circle_bar(percent)
@@ -91,6 +97,7 @@ def make_progress_text(title, done, total, speed, eta):
         f"⏳ ETA: **{format_time(eta)}**"
     )
 
+
 async def safe_edit(msg, text, reply_markup=None):
     try:
         await msg.edit(text, reply_markup=reply_markup)
@@ -99,49 +106,88 @@ async def safe_edit(msg, text, reply_markup=None):
 
 
 # ==========================
-# ✅ STREAMING FIX (Keyframes + FastStart)
+# ✅ FFmpeg faststart step animation (Processing bar)
 # ==========================
-async def mp4_streaming_fix(input_path: str, status_msg=None):
+async def ffmpeg_processing_bar(uid, status_msg, USER_CANCEL, title="⚡ Fixing Streaming (FastStart)..."):
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_{uid}")]])
+    step = 0
+    while True:
+        if uid in USER_CANCEL:
+            raise asyncio.CancelledError
+
+        step += 1
+        percent = (step * 17) % 100  # fake animated percent
+
+        await safe_edit(
+            status_msg,
+            f"✨ **{title}**\n\n"
+            f"{make_circle_bar(percent)}\n\n"
+            f"⏳ Please wait...",
+            kb
+        )
+        await asyncio.sleep(2)
+
+
+# ==========================
+# ✅ FASTSTART FIX (NO re-encode)
+# ==========================
+async def mp4_faststart(input_path: str, status_msg=None, uid=None, USER_CANCEL=None):
     """
-    100% fix Telegram seek/back restart problem.
-    - Re-encode H.264 with frequent keyframes
-    - FastStart enabled
+    Very fast Telegram smooth streaming fix.
+    - No re-encode
+    - Fix moov atom position
     """
     if not input_path.lower().endswith(".mp4"):
         return input_path
 
-    out_path = os.path.splitext(input_path)[0] + "_stream.mp4"
-    if os.path.exists(out_path) and os.path.getsize(out_path) > 1024 * 50:
-        return out_path
-
-    if status_msg:
-        await safe_edit(status_msg, "⚡ Fixing Streaming (Keyframes + FastStart)...\n⏳ Please wait...")
-
-    cmd = [
-        "ffmpeg", "-y",
-        "-i", input_path,
-        "-c:v", "libx264",
-        "-preset", "veryfast",
-        "-crf", "23",
-        "-g", "48",
-        "-keyint_min", "48",
-        "-sc_threshold", "0",
-        "-c:a", "aac",
-        "-b:a", "128k",
-        "-movflags", "+faststart",
-        out_path
-    ]
-
-    proc = await asyncio.create_subprocess_exec(
-        *cmd,
-        stdout=asyncio.subprocess.DEVNULL,
-        stderr=asyncio.subprocess.DEVNULL
-    )
-    await proc.wait()
-
+    out_path = os.path.splitext(input_path)[0] + "_fast.mp4"
     if os.path.exists(out_path) and os.path.getsize(out_path) > 1024:
         return out_path
 
+    anim_task = None
+    try:
+        if status_msg and uid and USER_CANCEL is not None:
+            anim_task = asyncio.create_task(
+                ffmpeg_processing_bar(uid, status_msg, USER_CANCEL, "⚡ Fixing Streaming (FastStart)...")
+            )
+
+        cmd = [
+            "ffmpeg", "-y",
+            "-i", input_path,
+            "-c", "copy",
+            "-movflags", "+faststart",
+            out_path
+        ]
+
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL
+        )
+
+        while True:
+            if uid and USER_CANCEL is not None and uid in USER_CANCEL:
+                try:
+                    proc.kill()
+                except:
+                    pass
+                raise asyncio.CancelledError
+
+            if proc.returncode is not None:
+                break
+            await asyncio.sleep(1)
+
+        await proc.wait()
+
+    finally:
+        try:
+            if anim_task and not anim_task.done():
+                anim_task.cancel()
+        except:
+            pass
+
+    if os.path.exists(out_path) and os.path.getsize(out_path) > 1024:
+        return out_path
     return input_path
 
 
@@ -162,6 +208,7 @@ def get_video_duration(path: str):
         return int(d)
     except:
         return 0
+
 
 async def gen_thumbnail(input_path: str, out_thumb: str):
     dur = get_video_duration(input_path)
@@ -284,6 +331,7 @@ async def upload_progress(current, total, status_msg, uid, start_time, USER_CANC
 # ==========================
 URL_STATE = {}  # uid -> url
 
+
 async def url_flow(client, message, url: str):
     if not is_url(url):
         return await message.reply("❌ Valid URL send cheyyu (http/https).")
@@ -320,7 +368,7 @@ async def url_callback_router(client, cb, USER_TASKS, USER_CANCEL, get_or_create
     async def job():
         file_path = None
         thumb = None
-        stream_path = None
+        fast_path = None
         try:
             USER_CANCEL.discard(uid)
             kb_cancel = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_{uid}")]])
@@ -338,10 +386,10 @@ async def url_callback_router(client, cb, USER_TASKS, USER_CANCEL, get_or_create
 
             upload_file = file_path
 
-            # ✅ ONLY for Video Upload mode
+            # ✅ FastStart fix (FAST + progress bar)
             if mode == "video" and file_path.lower().endswith(".mp4"):
-                stream_path = await mp4_streaming_fix(file_path, status_msg=status)
-                upload_file = stream_path
+                fast_path = await mp4_faststart(file_path, status_msg=status, uid=uid, USER_CANCEL=USER_CANCEL)
+                upload_file = fast_path
 
             size = os.path.getsize(upload_file)
             up_start = time.time()
@@ -383,7 +431,7 @@ async def url_callback_router(client, cb, USER_TASKS, USER_CANCEL, get_or_create
             URL_STATE.pop(uid, None)
             USER_CANCEL.discard(uid)
 
-            for p in [thumb, stream_path, file_path]:
+            for p in [thumb, fast_path, file_path]:
                 try:
                     if p and os.path.exists(p):
                         os.remove(p)
