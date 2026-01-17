@@ -129,6 +129,31 @@ async def get_filename_and_size(url: str):
     return safe_filename(filename), total
 
 
+# ✅ Telegram upload progress bar
+async def upload_progress(current, total, status_msg, uid, start_time, USER_CANCEL: set):
+    if uid in USER_CANCEL:
+        raise asyncio.CancelledError
+
+    elapsed = time.time() - start_time
+    speed = current / elapsed if elapsed > 0 else 0
+    eta = (total - current) / speed if speed > 0 else 0
+
+    now = time.time()
+    if not hasattr(status_msg, "_last_edit"):
+        status_msg._last_edit = 0
+
+    if now - status_msg._last_edit > 3:
+        status_msg._last_edit = now
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("❌ Cancel Upload", callback_data=f"cancel_{uid}")]
+        ])
+        await safe_edit(
+            status_msg,
+            make_progress_text("📤 Uploading...", current, total, speed, eta),
+            reply_markup=kb
+        )
+
+
 async def download_stream(url, file_path, status_msg, uid, USER_CANCEL: set):
     USER_CANCEL.discard(uid)
     timeout = aiohttp.ClientTimeout(total=None)
@@ -151,6 +176,12 @@ async def download_stream(url, file_path, status_msg, uid, USER_CANCEL: set):
 
             os.makedirs(os.path.dirname(file_path), exist_ok=True)
 
+            # ✅ first edit immediately (so progress always shows)
+            kb0 = InlineKeyboardMarkup([
+                [InlineKeyboardButton("❌ Cancel Download", callback_data=f"cancel_{uid}")]
+            ])
+            await safe_edit(status_msg, make_progress_text("⬇️ Downloading...", 0, total, 0, 0), reply_markup=kb0)
+
             with open(file_path, "wb") as f:
                 async for chunk in r.content.iter_chunked(CHUNK_SIZE):
                     if uid in USER_CANCEL:
@@ -164,7 +195,8 @@ async def download_stream(url, file_path, status_msg, uid, USER_CANCEL: set):
                     speed = downloaded / elapsed if elapsed > 0 else 0
                     eta = (total - downloaded) / speed if total and speed > 0 else 0
 
-                    if time.time() - last_edit > 6:
+                    # ✅ 3 sec interval = smooth + floodwait safe
+                    if time.time() - last_edit > 3:
                         last_edit = time.time()
                         kb = InlineKeyboardMarkup([
                             [InlineKeyboardButton("❌ Cancel Download", callback_data=f"cancel_{uid}")]
@@ -202,7 +234,7 @@ def ffprobe_video_info(path: str):
 
 async def gen_thumbnail(input_path: str, out_thumb: str):
     dur, _, _ = ffprobe_video_info(input_path)
-    ss = dur // 2 if dur and dur > 8 else 3
+    ss = dur // 2 if dur and dur > 8 else 3  # ✅ middle frame
     cmd = [
         "ffmpeg", "-y",
         "-ss", str(ss),
@@ -228,7 +260,8 @@ async def fix_faststart(input_path: str, status_msg=None):
     out_path = os.path.splitext(input_path)[0] + "_fast.mp4"
 
     if status_msg:
-        await safe_edit(status_msg, "⚡ Fixing Streaming (FastStart)...\n⏳ Please wait...")
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("⏳ Please wait", callback_data="noop")]])
+        await safe_edit(status_msg, "⚡ Fixing Streaming (FastStart)...\n⏳ Please wait...", reply_markup=kb)
 
     cmd = [
         "ffmpeg", "-y",
@@ -303,10 +336,13 @@ async def url_callback_router(client, cb, USER_TASKS, USER_CANCEL, get_or_create
 
             upload_path = file_path
 
+            # ✅ faststart optimize
             if mode == "video" and file_path.lower().endswith(".mp4"):
                 upload_path = await fix_faststart(file_path, status)
 
             size = os.path.getsize(upload_path)
+
+            up_start = time.time()
 
             if mode == "video":
                 thumb = os.path.splitext(upload_path)[0] + "_thumb.jpg"
@@ -322,19 +358,25 @@ async def url_callback_router(client, cb, USER_TASKS, USER_CANCEL, get_or_create
                 if w > 0: args["width"] = w
                 if h > 0: args["height"] = h
 
+                await safe_edit(status, "📤 Upload Starting...")
                 await client.send_video(
                     chat_id=cb.message.chat.id,
                     video=upload_path,
                     caption=f"✅ Uploaded 🎥\n\n📌 `{name_clean}`\n📦 {naturalsize(size)}",
                     supports_streaming=True,
                     thumb=thumb if thumb and os.path.exists(thumb) else None,
+                    progress=upload_progress,
+                    progress_args=(status, uid, up_start, USER_CANCEL),
                     **args
                 )
             else:
+                await safe_edit(status, "📤 Upload Starting...")
                 await client.send_document(
                     chat_id=cb.message.chat.id,
                     document=upload_path,
-                    caption=f"✅ Uploaded 📁\n\n📌 `{name_clean}`\n📦 {naturalsize(size)}"
+                    caption=f"✅ Uploaded 📁\n\n📌 `{name_clean}`\n📦 {naturalsize(size)}",
+                    progress=upload_progress,
+                    progress_args=(status, uid, up_start, USER_CANCEL)
                 )
 
             await safe_edit(status, "✅ Done ✅", reply_markup=main_menu_keyboard())
@@ -346,6 +388,7 @@ async def url_callback_router(client, cb, USER_TASKS, USER_CANCEL, get_or_create
         finally:
             URL_STATE.pop(uid, None)
             USER_CANCEL.discard(uid)
+
             for p in [thumb, file_path]:
                 try:
                     if p and os.path.exists(p):
