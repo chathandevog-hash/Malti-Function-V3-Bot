@@ -4,7 +4,9 @@ import time
 import json
 import asyncio
 import subprocess
+
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from pyrogram.errors import FloodWait
 
 DOWNLOAD_DIR = os.getenv("DOWNLOAD_DIR", "downloads")
 
@@ -25,11 +27,30 @@ def clean_insta_url(text: str) -> str:
     return m.group(1) if m else (text or "").strip()
 
 
+# ===============================
+# FLOODWAIT SAFE HELPERS ✅
+# ===============================
+async def safe_send(message, text, reply_markup=None):
+    while True:
+        try:
+            return await message.reply(text, reply_markup=reply_markup)
+        except FloodWait as e:
+            await asyncio.sleep(int(e.value) + 1)
+        except:
+            return None
+
+
 async def safe_edit(msg, text, reply_markup=None):
-    try:
-        await msg.edit(text, reply_markup=reply_markup)
-    except:
-        pass
+    if not msg:
+        return
+    while True:
+        try:
+            await msg.edit(text, reply_markup=reply_markup)
+            return
+        except FloodWait as e:
+            await asyncio.sleep(int(e.value) + 1)
+        except:
+            return
 
 
 # ===============================
@@ -99,22 +120,36 @@ def fancy_bar(step: int):
     return bars[step % len(bars)]
 
 
+# ===============================
+# Progress Animator (FLOODSAFE) ✅
+# ===============================
 async def progress_animator(uid: int, status_msg, label: str):
+    """
+    Old version edited every 2.3s -> FloodWait.
+    ✅ Now edits every 10-12s (safe) so progress always visible.
+    """
     kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_{uid}")]])
     step = 0
+    last_edit = 0
+
     while True:
         if uid in USER_CANCEL:
             return
-        step += 1
-        await safe_edit(
-            status_msg,
-            f"📥 Instagram Reel Detected ✅\n\n"
-            f"⚙️ {label}\n\n"
-            f"{fancy_bar(step)}\n\n"
-            f"⏳ Please wait...",
-            reply_markup=kb
-        )
-        await asyncio.sleep(2.3)
+
+        now = time.time()
+        if now - last_edit >= 11:  # ✅ floodwait safe
+            last_edit = now
+            step += 1
+            await safe_edit(
+                status_msg,
+                f"📥 Instagram Reel Detected ✅\n\n"
+                f"⚙️ {label}\n\n"
+                f"{fancy_bar(step)}\n\n"
+                f"⏳ Please wait...",
+                reply_markup=kb
+            )
+
+        await asyncio.sleep(1.0)
 
 
 # ===============================
@@ -144,7 +179,6 @@ async def insta_download(url: str, uid: int):
         stderr=asyncio.subprocess.STDOUT
     )
 
-    # read output (not required for UI)
     while True:
         if uid in USER_CANCEL:
             try:
@@ -179,7 +213,9 @@ async def insta_download(url: str, uid: int):
 async def insta_entry(client, message, url: str, USER_TASKS, main_menu_keyboard):
     uid = message.from_user.id
 
-    status = await message.reply("📥 Instagram Reel Detected ✅\n\n⏳ Starting...")
+    status = await safe_send(message, "📥 Instagram Reel Detected ✅\n\n⏳ Starting...")
+    if not status:
+        return
 
     async def job():
         file_path = None
@@ -240,6 +276,13 @@ async def insta_entry(client, message, url: str, USER_TASKS, main_menu_keyboard)
 
         finally:
             USER_CANCEL.discard(uid)
+
+            try:
+                if anim_task and not anim_task.done():
+                    anim_task.cancel()
+            except:
+                pass
+
             try:
                 if file_path and os.path.exists(file_path):
                     os.remove(file_path)
