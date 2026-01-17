@@ -80,16 +80,33 @@ def make_circle_bar(percent: float, slots: int = 14):
     return f"[{icon * filled}{'⚪' * (slots - filled)}]"
 
 
-def make_progress_text(title, done, total, speed, eta):
+def spinner_frame(tick: int):
+    frames = ["⠁", "⠃", "⠇", "⠧", "⠷", "⠿", "⠟", "⠯"]
+    return frames[tick % len(frames)]
+
+
+def make_progress_text(title, done, total, speed, eta, tick=0):
+    speed_str = naturalsize(int(speed)) + "/s" if speed else "0 B/s"
+
+    # ✅ total unknown → no % based bar
+    if not total or total <= 0:
+        spin = spinner_frame(tick)
+        return (
+            f"✨ **{title}**\n\n"
+            f"{spin} Downloading... (Unknown total size)\n\n"
+            f"📦 Downloaded: **{naturalsize(done)}**\n"
+            f"⚡ Speed: **{speed_str}**\n"
+            f"⏳ ETA: **Unknown**"
+        )
+
     percent = (done / total * 100) if total else 0
     bar = make_circle_bar(percent)
-    speed_str = naturalsize(int(speed)) + "/s" if speed else "0 B/s"
 
     return (
         f"✨ **{title}**\n\n"
         f"{bar}\n\n"
         f"📊 Progress: **{percent:.2f}%**\n"
-        f"📦 Size: **{naturalsize(done)} / {naturalsize(total) if total else 'Unknown'}**\n"
+        f"📦 Size: **{naturalsize(done)} / {naturalsize(total)}**\n"
         f"⚡ Speed: **{speed_str}**\n"
         f"⏳ ETA: **{format_time(eta)}**"
     )
@@ -162,6 +179,7 @@ async def download_stream(url, file_path, status_msg, uid, USER_CANCEL: set):
     start_time = time.time()
     last_edit = 0
     total = 0
+    tick = 0
 
     async with aiohttp.ClientSession(timeout=timeout) as session:
         async with session.get(url, allow_redirects=True) as r:
@@ -171,16 +189,16 @@ async def download_stream(url, file_path, status_msg, uid, USER_CANCEL: set):
             if r.headers.get("Content-Length"):
                 total = int(r.headers.get("Content-Length"))
 
+            # ✅ enforce limit only if total is known
             if total and total > URL_UPLOAD_LIMIT:
                 raise Exception("❌ URL file too large (max 2GB)")
 
             os.makedirs(os.path.dirname(file_path), exist_ok=True)
 
-            # ✅ first edit immediately (so progress always shows)
             kb0 = InlineKeyboardMarkup([
                 [InlineKeyboardButton("❌ Cancel Download", callback_data=f"cancel_{uid}")]
             ])
-            await safe_edit(status_msg, make_progress_text("⬇️ Downloading...", 0, total, 0, 0), reply_markup=kb0)
+            await safe_edit(status_msg, make_progress_text("⬇️ Downloading...", 0, total, 0, 0, tick=tick), reply_markup=kb0)
 
             with open(file_path, "wb") as f:
                 async for chunk in r.content.iter_chunked(CHUNK_SIZE):
@@ -188,22 +206,28 @@ async def download_stream(url, file_path, status_msg, uid, USER_CANCEL: set):
                         raise asyncio.CancelledError
                     if not chunk:
                         continue
+
                     f.write(chunk)
                     downloaded += len(chunk)
+
+                    # ✅ extra safety: hard cap download when total unknown
+                    if (not total) and downloaded > URL_UPLOAD_LIMIT:
+                        raise Exception("❌ URL file exceeded 2GB limit while downloading")
 
                     elapsed = time.time() - start_time
                     speed = downloaded / elapsed if elapsed > 0 else 0
                     eta = (total - downloaded) / speed if total and speed > 0 else 0
 
-                    # ✅ 3 sec interval = smooth + floodwait safe
+                    # ✅ update every 3 sec
                     if time.time() - last_edit > 3:
                         last_edit = time.time()
+                        tick += 1
                         kb = InlineKeyboardMarkup([
                             [InlineKeyboardButton("❌ Cancel Download", callback_data=f"cancel_{uid}")]
                         ])
                         await safe_edit(
                             status_msg,
-                            make_progress_text("⬇️ Downloading...", downloaded, total, speed, eta),
+                            make_progress_text("⬇️ Downloading...", downloaded, total, speed, eta, tick=tick),
                             reply_markup=kb
                         )
 
@@ -234,7 +258,7 @@ def ffprobe_video_info(path: str):
 
 async def gen_thumbnail(input_path: str, out_thumb: str):
     dur, _, _ = ffprobe_video_info(input_path)
-    ss = dur // 2 if dur and dur > 8 else 3  # ✅ middle frame
+    ss = dur // 2 if dur and dur > 8 else 3
     cmd = [
         "ffmpeg", "-y",
         "-ss", str(ss),
@@ -341,7 +365,6 @@ async def url_callback_router(client, cb, USER_TASKS, USER_CANCEL, get_or_create
                 upload_path = await fix_faststart(file_path, status)
 
             size = os.path.getsize(upload_path)
-
             up_start = time.time()
 
             if mode == "video":
