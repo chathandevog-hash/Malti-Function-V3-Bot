@@ -9,6 +9,10 @@ DOWNLOAD_DIR = os.getenv("DOWNLOAD_DIR", "downloads")
 
 INSTA_REGEX = re.compile(r"(https?://(www\.)?instagram\.com/(reel|p)/[A-Za-z0-9_\-]+)")
 
+# Optional cookie file path (if you want better success rate)
+# Render: upload cookie.txt into repo OR mount it
+INSTA_COOKIES = os.getenv("INSTA_COOKIES", "").strip()  # Example: "cookies.txt"
+
 try:
     from bot import USER_CANCEL
 except:
@@ -27,69 +31,134 @@ async def safe_edit(msg, text, reply_markup=None):
     except:
         pass
 
-# ✅ download + progress always alive
-async def insta_download(url: str, uid: int, status_msg=None):
+# =========================
+# Instagram Download
+# =========================
+async def insta_download(url: str, uid: int, status_msg=None, retries: int = 2):
+    """
+    Download instagram reel as MP4 using yt-dlp.
+    - Progress animation always alive
+    - Better error reason
+    - Retry support
+    """
     os.makedirs(DOWNLOAD_DIR, exist_ok=True)
-    outtmpl = os.path.join(DOWNLOAD_DIR, f"insta_{uid}_{int(time.time())}.%(ext)s")
-
-    cmd = [
-        "yt-dlp",
-        "-f", "bv*+ba/best",
-        "--merge-output-format", "mp4",
-        "-o", outtmpl,
-        "--newline",
-        url
-    ]
+    url = clean_insta_url(url)
 
     kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_{uid}")]])
 
-    proc = await asyncio.create_subprocess_exec(
-        *cmd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.STDOUT
-    )
+    # Retry loop
+    last_error = None
+    for attempt in range(1, retries + 2):
+        outtmpl = os.path.join(DOWNLOAD_DIR, f"insta_{uid}_{int(time.time())}.%(ext)s")
 
-    last_anim = 0
-    anim_state = 0
+        cmd = [
+            "yt-dlp",
+            "-f", "bv*+ba/best",
+            "--merge-output-format", "mp4",
+            "--no-playlist",
+            "--no-warnings",
+            "--newline",
+            "--retries", "3",
+            "--socket-timeout", "30",
+            "-o", outtmpl,
+            url
+        ]
 
-    while True:
-        if uid in USER_CANCEL:
-            try:
-                proc.kill()
-            except:
-                pass
-            raise asyncio.CancelledError
+        # If cookie path provided and exists
+        if INSTA_COOKIES and os.path.exists(INSTA_COOKIES):
+            cmd.insert(1, "--cookies")
+            cmd.insert(2, INSTA_COOKIES)
 
-        line = await proc.stdout.readline()
-        if not line:
-            break
-
-        # even if no progress lines, keep UI alive
-        if status_msg and time.time() - last_anim > 3:
-            last_anim = time.time()
-            anim_state = (anim_state + 1) % 3
-            dots = "." * (anim_state + 1)
+        if status_msg:
             await safe_edit(
                 status_msg,
-                f"📥 Downloading Reel{dots}\n\n🟠🟠🟠🟠🟠⚪⚪⚪⚪⚪⚪⚪⚪⚪\n\n⏳ Please wait...",
+                f"📥 Instagram downloading...\n\n"
+                f"🔄 Attempt: **{attempt}/{retries+1}**\n"
+                f"⏳ Please wait...",
                 reply_markup=kb
             )
 
-    await proc.wait()
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT
+        )
 
-    if proc.returncode != 0:
-        raise Exception("Insta download failed")
+        last_anim = 0
+        anim_state = 0
+        last_lines = []
 
-    mp4_path = outtmpl.replace("%(ext)s", "mp4")
-    if os.path.exists(mp4_path):
-        return mp4_path
+        while True:
+            if uid in USER_CANCEL:
+                try:
+                    proc.kill()
+                except:
+                    pass
+                raise asyncio.CancelledError
 
-    # fallback
-    files = [f for f in os.listdir(DOWNLOAD_DIR) if f.startswith(f"insta_{uid}_") and f.endswith(".mp4")]
-    if not files:
-        raise Exception("Downloaded mp4 not found")
-    files.sort(key=lambda x: os.path.getmtime(os.path.join(DOWNLOAD_DIR, x)), reverse=True)
-    return os.path.join(DOWNLOAD_DIR, files[0])
+            line = await proc.stdout.readline()
+            if not line:
+                break
+
+            text = line.decode(errors="ignore").strip()
+            if text:
+                last_lines.append(text)
+                last_lines = last_lines[-35:]  # keep last 35 lines
+
+            # ✅ Keep UI alive even if no % lines
+            if status_msg and time.time() - last_anim > 3:
+                last_anim = time.time()
+                anim_state = (anim_state + 1) % 3
+                dots = "." * (anim_state + 1)
+
+                await safe_edit(
+                    status_msg,
+                    f"📥 Downloading Reel{dots}\n\n"
+                    f"🟠🟠🟠🟠🟠⚪⚪⚪⚪⚪⚪⚪⚪⚪\n\n"
+                    f"🔄 Attempt: **{attempt}/{retries+1}**\n"
+                    f"⏳ Please wait...",
+                    reply_markup=kb
+                )
+
+        await proc.wait()
+
+        # Success case
+        if proc.returncode == 0:
+            mp4_path = outtmpl.replace("%(ext)s", "mp4")
+            if os.path.exists(mp4_path):
+                return mp4_path
+
+            # fallback
+            files = [
+                f for f in os.listdir(DOWNLOAD_DIR)
+                if f.startswith(f"insta_{uid}_") and f.endswith(".mp4")
+            ]
+            if files:
+                files.sort(key=lambda x: os.path.getmtime(os.path.join(DOWNLOAD_DIR, x)), reverse=True)
+                return os.path.join(DOWNLOAD_DIR, files[0])
+
+            last_error = "Downloaded mp4 not found"
+            continue
+
+        # Fail case → analyse reason
+        joined = "\n".join(last_lines).lower()
+
+        if "login required" in joined or "cookies" in joined:
+            last_error = "Instagram login required / cookies needed ❌"
+        elif "private" in joined or "restricted" in joined:
+            last_error = "This reel is private / restricted ❌"
+        elif "429" in joined or "rate limit" in joined:
+            last_error = "Instagram rate limited / blocked. Try later ❌"
+        elif "not found" in joined or "404" in joined:
+            last_error = "Reel not found (deleted / wrong link) ❌"
+        else:
+            last_error = "Instagram download failed (blocked). Try another reel ❌"
+
+        # retry after short delay (except cookies/login)
+        if attempt < retries + 1:
+            await asyncio.sleep(2)
+
+    raise Exception(last_error or "Insta download failed ❌")
 
 # =========================
 # ENTRY + CALLBACKS
@@ -98,7 +167,7 @@ INSTA_STATE = {}
 
 async def insta_entry(client, message, url: str):
     uid = message.from_user.id
-    INSTA_STATE[uid] = {"url": url}
+    INSTA_STATE[uid] = {"url": clean_insta_url(url)}
 
     kb = InlineKeyboardMarkup([
         [
@@ -107,7 +176,10 @@ async def insta_entry(client, message, url: str):
         ],
         [InlineKeyboardButton("⬅️ Back", callback_data="back_main")]
     ])
-    await message.reply(f"✅ Instagram Reel Detected 📸\n\n📌 {url}\n\n👇 Select format:", reply_markup=kb)
+    await message.reply(
+        f"✅ Instagram Reel Detected 📸\n\n📌 {INSTA_STATE[uid]['url']}\n\n👇 Select format:",
+        reply_markup=kb
+    )
 
 async def insta_callback_router(client, cb, USER_TASKS, USER_CANCEL, get_or_create_status, main_menu_keyboard, DOWNLOAD_DIR):
     uid = cb.from_user.id
@@ -133,7 +205,7 @@ async def insta_callback_router(client, cb, USER_TASKS, USER_CANCEL, get_or_crea
             USER_CANCEL.discard(uid)
             await safe_edit(status, "📥 Instagram downloading...\n⏳ Please wait...", kb)
 
-            file_path = await insta_download(url, uid, status_msg=status)
+            file_path = await insta_download(url, uid, status_msg=status, retries=2)
 
             if uid in USER_CANCEL:
                 raise asyncio.CancelledError
@@ -141,9 +213,18 @@ async def insta_callback_router(client, cb, USER_TASKS, USER_CANCEL, get_or_crea
             await safe_edit(status, "📤 Uploading...", kb)
 
             if mode == "video":
-                await client.send_video(cb.message.chat.id, video=file_path, caption="✅ Instagram Reel 🎥", supports_streaming=True)
+                await client.send_video(
+                    cb.message.chat.id,
+                    video=file_path,
+                    caption="✅ Instagram Reel 🎥",
+                    supports_streaming=True
+                )
             else:
-                await client.send_document(cb.message.chat.id, document=file_path, caption="✅ Instagram Reel 📁")
+                await client.send_document(
+                    cb.message.chat.id,
+                    document=file_path,
+                    caption="✅ Instagram Reel 📁"
+                )
 
             await safe_edit(status, "✅ Done ✅", reply_markup=main_menu_keyboard())
 
