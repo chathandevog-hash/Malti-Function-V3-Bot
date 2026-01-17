@@ -99,85 +99,23 @@ async def safe_edit(msg, text, reply_markup=None):
 
 
 # ==========================
-# ✅ Video Metadata (duration/width/height)
+# ✅ STREAMING FIX (Keyframes + FastStart)
 # ==========================
-def get_video_meta(path: str):
-    """
-    returns (duration:int, width:int, height:int)
-    """
-    try:
-        cmd = [
-            "ffprobe", "-v", "error",
-            "-select_streams", "v:0",
-            "-show_entries", "stream=width,height:format=duration",
-            "-of", "json",
-            path
-        ]
-        out = subprocess.check_output(cmd).decode("utf-8", errors="ignore")
-        data = json.loads(out)
-
-        duration = int(float(data.get("format", {}).get("duration", 0) or 0))
-        streams = data.get("streams", []) or []
-        width = int(streams[0].get("width", 0) or 0) if streams else 0
-        height = int(streams[0].get("height", 0) or 0) if streams else 0
-
-        return duration, width, height
-    except:
-        return 0, 0, 0
-
-
-# ==========================
-# ✅ Smooth Streaming Fix (Seek Bug)
-# ==========================
-async def mp4_faststart(input_path: str, status_msg=None):
-    """
-    FastStart fix. No re-encode.
-    """
-    if not input_path.lower().endswith(".mp4"):
-        return input_path
-
-    out_path = os.path.splitext(input_path)[0] + "_fast.mp4"
-    if os.path.exists(out_path):
-        return out_path
-
-    if status_msg:
-        await safe_edit(status_msg, "⚡ Optimizing (FastStart)...\n⏳ Please wait...")
-
-    cmd = [
-        "ffmpeg", "-y",
-        "-i", input_path,
-        "-c", "copy",
-        "-movflags", "+faststart",
-        out_path
-    ]
-
-    proc = await asyncio.create_subprocess_exec(
-        *cmd,
-        stdout=asyncio.subprocess.DEVNULL,
-        stderr=asyncio.subprocess.DEVNULL
-    )
-    await proc.wait()
-
-    if os.path.exists(out_path) and os.path.getsize(out_path) > 1024:
-        return out_path
-
-    return input_path
-
-
 async def mp4_streaming_fix(input_path: str, status_msg=None):
     """
-    ✅ Strong fix (Re-encode): Keyframes + FastStart
-    prevents seek/back jumping to start in Telegram
+    100% fix Telegram seek/back restart problem.
+    - Re-encode H.264 with frequent keyframes
+    - FastStart enabled
     """
     if not input_path.lower().endswith(".mp4"):
         return input_path
 
     out_path = os.path.splitext(input_path)[0] + "_stream.mp4"
-    if os.path.exists(out_path):
+    if os.path.exists(out_path) and os.path.getsize(out_path) > 1024 * 50:
         return out_path
 
     if status_msg:
-        await safe_edit(status_msg, "⚡ Fixing Smooth Streaming...\n(Keyframes + FastStart)\n⏳ Please wait...")
+        await safe_edit(status_msg, "⚡ Fixing Streaming (Keyframes + FastStart)...\n⏳ Please wait...")
 
     cmd = [
         "ffmpeg", "-y",
@@ -208,7 +146,7 @@ async def mp4_streaming_fix(input_path: str, status_msg=None):
 
 
 # ==========================
-# ✅ HD THUMBNAIL (middle frame)
+# THUMBNAIL (middle frame)
 # ==========================
 def get_video_duration(path: str):
     try:
@@ -225,32 +163,25 @@ def get_video_duration(path: str):
     except:
         return 0
 
-
 async def gen_thumbnail(input_path: str, out_thumb: str):
-    """
-    ✅ HD thumbnail 1280px width from middle frame
-    """
     dur = get_video_duration(input_path)
     ss = dur // 2 if dur and dur > 6 else 3
-
     cmd = [
         "ffmpeg", "-y",
         "-ss", str(ss),
         "-i", input_path,
         "-frames:v", "1",
-        "-vf", "scale=1280:-1",
-        "-q:v", "1",
+        "-vf", "scale=640:-1",
+        "-q:v", "2",
         out_thumb
     ]
-
     proc = await asyncio.create_subprocess_exec(
         *cmd,
         stdout=asyncio.subprocess.DEVNULL,
         stderr=asyncio.subprocess.DEVNULL
     )
     await proc.wait()
-
-    return os.path.exists(out_thumb) and os.path.getsize(out_thumb) > 8000
+    return os.path.exists(out_thumb)
 
 
 # ==========================
@@ -322,11 +253,7 @@ async def download_stream(url, file_path, status_msg, uid, USER_CANCEL):
                         kb = InlineKeyboardMarkup([
                             [InlineKeyboardButton("❌ Cancel Download", callback_data=f"cancel_{uid}")]
                         ])
-                        await safe_edit(
-                            status_msg,
-                            make_progress_text("⬇️ Downloading", downloaded, total, speed, eta),
-                            kb
-                        )
+                        await safe_edit(status_msg, make_progress_text("⬇️ Downloading", downloaded, total, speed, eta), kb)
 
 
 # ==========================
@@ -349,11 +276,7 @@ async def upload_progress(current, total, status_msg, uid, start_time, USER_CANC
         kb = InlineKeyboardMarkup([
             [InlineKeyboardButton("❌ Cancel Upload", callback_data=f"cancel_{uid}")]
         ])
-        await safe_edit(
-            status_msg,
-            make_progress_text("📤 Uploading", current, total, speed, eta),
-            kb
-        )
+        await safe_edit(status_msg, make_progress_text("📤 Uploading", current, total, speed, eta), kb)
 
 
 # ==========================
@@ -397,7 +320,7 @@ async def url_callback_router(client, cb, USER_TASKS, USER_CANCEL, get_or_create
     async def job():
         file_path = None
         thumb = None
-        fixed_path = None
+        stream_path = None
         try:
             USER_CANCEL.discard(uid)
             kb_cancel = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_{uid}")]])
@@ -413,12 +336,12 @@ async def url_callback_router(client, cb, USER_TASKS, USER_CANCEL, get_or_create
             if uid in USER_CANCEL:
                 raise asyncio.CancelledError
 
-            # ✅ streaming / seek fix
-            fixed_path = await mp4_faststart(file_path, status_msg=status)
-            if fixed_path.lower().endswith(".mp4"):
-                fixed_path = await mp4_streaming_fix(fixed_path, status_msg=status)
+            upload_file = file_path
 
-            upload_file = fixed_path if fixed_path else file_path
+            # ✅ ONLY for Video Upload mode
+            if mode == "video" and file_path.lower().endswith(".mp4"):
+                stream_path = await mp4_streaming_fix(file_path, status_msg=status)
+                upload_file = stream_path
 
             size = os.path.getsize(upload_file)
             up_start = time.time()
@@ -430,13 +353,6 @@ async def url_callback_router(client, cb, USER_TASKS, USER_CANCEL, get_or_create
                 except:
                     thumb = None
 
-                # ✅ metadata
-                duration, width, height = get_video_meta(upload_file)
-                meta_args = {}
-                if duration > 0: meta_args["duration"] = duration
-                if width > 0: meta_args["width"] = width
-                if height > 0: meta_args["height"] = height
-
                 await safe_edit(status, "📤 Uploading...", kb_cancel)
                 await client.send_video(
                     chat_id=cb.message.chat.id,
@@ -445,8 +361,7 @@ async def url_callback_router(client, cb, USER_TASKS, USER_CANCEL, get_or_create
                     supports_streaming=True,
                     thumb=thumb if thumb and os.path.exists(thumb) else None,
                     progress=upload_progress,
-                    progress_args=(status, uid, up_start, USER_CANCEL),
-                    **meta_args
+                    progress_args=(status, uid, up_start, USER_CANCEL)
                 )
             else:
                 await safe_edit(status, "📤 Uploading...", kb_cancel)
@@ -468,7 +383,7 @@ async def url_callback_router(client, cb, USER_TASKS, USER_CANCEL, get_or_create
             URL_STATE.pop(uid, None)
             USER_CANCEL.discard(uid)
 
-            for p in [thumb, fixed_path, file_path]:
+            for p in [thumb, stream_path, file_path]:
                 try:
                     if p and os.path.exists(p):
                         os.remove(p)
