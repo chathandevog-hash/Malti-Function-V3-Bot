@@ -7,7 +7,7 @@ from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from config import BOT_TOKEN, API_ID, API_HASH, DOWNLOAD_DIR
 
 # ✅ Modules
-from url import url_flow, url_callback_router
+from url import url_flow, url_callback_router, is_url
 from compress import compressor_entry, compressor_callback_router
 from insta import is_instagram_url, clean_insta_url, insta_entry
 from youtube import is_youtube_url, clean_youtube_url, youtube_entry, youtube_callback_router
@@ -171,6 +171,12 @@ async def all_callbacks(client, cb):
             client, cb, USER_TASKS, USER_CANCEL, get_or_create_status, main_menu_keyboard, DOWNLOAD_DIR
         )
 
+    # fallback
+    try:
+        await cb.answer("✅", show_alert=False)
+    except:
+        pass
+
 
 # ===========================
 # TEXT HANDLER
@@ -185,12 +191,15 @@ async def text_handler(client, message):
 
     # ✅ Auto detect Instagram
     if is_instagram_url(text):
-        # ✅ FIXED: pass USER_TASKS + main_menu_keyboard
         return await insta_entry(client, message, clean_insta_url(text), USER_TASKS, main_menu_keyboard)
 
     # ✅ Auto detect YouTube
     if is_youtube_url(text):
         return await youtube_entry(client, message, clean_youtube_url(text))
+
+    # ✅ Auto detect Direct URL Uploader (NEW FIX ✅)
+    if is_url(text):
+        return await url_flow(client, message, text)
 
     state = USER_STATE.get(uid, "")
 
