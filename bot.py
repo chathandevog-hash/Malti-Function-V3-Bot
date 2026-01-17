@@ -1,5 +1,4 @@
 import os
-import re
 import asyncio
 
 from pyrogram import Client, filters
@@ -13,7 +12,7 @@ from compress import compressor_entry, compressor_callback_router
 from insta import is_instagram_url, clean_insta_url, insta_entry
 from youtube import is_youtube_url, clean_youtube_url, youtube_entry, youtube_callback_router
 
-# ✅ NEW: Terabox module
+# ✅ Terabox module
 from terabox import is_terabox_url, terabox_entry
 
 
@@ -174,21 +173,18 @@ async def all_callbacks(client, cb):
 
     # ✅ URL uploader callbacks
     if data.startswith("url_"):
-        await cb.answer()
         return await url_callback_router(
             client, cb, USER_TASKS, USER_CANCEL, get_or_create_status, main_menu_keyboard, DOWNLOAD_DIR
         )
 
     # ✅ compressor callbacks
     if data.startswith("cmp_"):
-        await cb.answer()
         return await compressor_callback_router(
             client, cb, USER_TASKS, USER_CANCEL, get_or_create_status, main_menu_keyboard, DOWNLOAD_DIR
         )
 
     # ✅ youtube callbacks
     if data.startswith("yt_"):
-        await cb.answer()
         return await youtube_callback_router(
             client, cb, USER_TASKS, USER_CANCEL, get_or_create_status, main_menu_keyboard, DOWNLOAD_DIR
         )
@@ -233,7 +229,6 @@ async def text_handler(client, message):
         return await url_flow(client, message, text)
 
     if state == "WAIT_TERABOX":
-        # if user selected terabox menu but pasted link
         if is_terabox_url(text):
             return await terabox_entry(client, message, text, USER_TASKS, main_menu_keyboard)
         return await message.reply("❌ Terabox link ayakku bro ✅", reply_markup=back_keyboard())
