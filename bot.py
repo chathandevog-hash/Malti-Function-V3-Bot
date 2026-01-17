@@ -6,10 +6,10 @@ from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 from config import BOT_TOKEN, API_ID, API_HASH, DOWNLOAD_DIR
 
-# ✅ Modules (must exist)
+# ✅ Modules
 from url import url_flow, url_callback_router
 from compress import compressor_entry, compressor_callback_router
-from insta import is_instagram_url, clean_insta_url, insta_entry, insta_callback_router
+from insta import is_instagram_url, clean_insta_url, insta_entry
 from youtube import is_youtube_url, clean_youtube_url, youtube_entry, youtube_callback_router
 
 # ===========================
@@ -33,6 +33,7 @@ async def get_or_create_status(message, uid):
     UI_STATUS_MSG[uid] = status
     return status
 
+
 def main_menu_keyboard():
     return InlineKeyboardMarkup([
         [
@@ -45,8 +46,10 @@ def main_menu_keyboard():
         ]
     ])
 
+
 def back_keyboard():
     return InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="back_main")]])
+
 
 WELCOME_TEXT = (
     "✨ **Welcome to Multifunctional Bot! 🤖💫**\n\n"
@@ -56,7 +59,7 @@ WELCOME_TEXT = (
     "🗜️ **Compressor**\n"
     "➜ Compress Video/File & get **Direct Download Link** ✅\n\n"
     "📸 **Instagram Reel Downloader**\n"
-    "➜ Send reel link & choose Video/File ✅\n\n"
+    "➜ Send reel link & bot will download + upload ✅\n\n"
     "▶️ **YouTube Downloader**\n"
     "➜ Send link ➜ Choose Video/File/Audio ➜ Select Quality ✅\n\n"
     "🚀 Now send something to start 👇😊"
@@ -81,12 +84,14 @@ async def start_cmd(client, message):
     USER_STATE.pop(uid, None)
     await message.reply(WELCOME_TEXT, reply_markup=main_menu_keyboard())
 
+
 @app.on_callback_query(filters.regex("^back_main$"))
 async def back_main(client, cb):
     uid = cb.from_user.id
     USER_STATE.pop(uid, None)
     await cb.answer()
     await cb.message.edit(WELCOME_TEXT, reply_markup=main_menu_keyboard())
+
 
 # ===========================
 # MENUS
@@ -97,11 +102,13 @@ async def menu_url(client, cb):
     await cb.answer()
     await cb.message.edit("🌐 **URL Uploader Mode**\n\nSend direct URL 👇", reply_markup=back_keyboard())
 
+
 @app.on_callback_query(filters.regex("^menu_compress$"))
 async def menu_compress(client, cb):
     USER_STATE[cb.from_user.id] = "WAIT_COMPRESS"
     await cb.answer()
     await cb.message.edit("🗜️ **Compressor Mode**\n\nSend a Video/File 👇", reply_markup=back_keyboard())
+
 
 @app.on_callback_query(filters.regex("^menu_insta$"))
 async def menu_insta(client, cb):
@@ -109,11 +116,13 @@ async def menu_insta(client, cb):
     await cb.answer()
     await cb.message.edit("📸 **Instagram Mode**\n\nSend Reel URL 👇", reply_markup=back_keyboard())
 
+
 @app.on_callback_query(filters.regex("^menu_youtube$"))
 async def menu_youtube(client, cb):
     USER_STATE[cb.from_user.id] = "WAIT_YOUTUBE"
     await cb.answer()
     await cb.message.edit("▶️ **YouTube Mode**\n\nSend YouTube URL 👇", reply_markup=back_keyboard())
+
 
 # ===========================
 # CANCEL
@@ -136,6 +145,7 @@ async def cancel_task(client, cb):
     except:
         pass
 
+
 # ===========================
 # ROUTE ALL CALLBACKS
 # ===========================
@@ -155,17 +165,12 @@ async def all_callbacks(client, cb):
             client, cb, USER_TASKS, USER_CANCEL, get_or_create_status, main_menu_keyboard, DOWNLOAD_DIR
         )
 
-    # Insta callbacks
-    if data.startswith("insta_"):
-        return await insta_callback_router(
-            client, cb, USER_TASKS, USER_CANCEL, get_or_create_status, main_menu_keyboard, DOWNLOAD_DIR
-        )
-
     # YouTube callbacks
     if data.startswith("yt_"):
         return await youtube_callback_router(
             client, cb, USER_TASKS, USER_CANCEL, get_or_create_status, main_menu_keyboard, DOWNLOAD_DIR
         )
+
 
 # ===========================
 # TEXT HANDLER
@@ -180,7 +185,8 @@ async def text_handler(client, message):
 
     # ✅ Auto detect Instagram
     if is_instagram_url(text):
-        return await insta_entry(client, message, clean_insta_url(text))
+        # ✅ FIXED: pass USER_TASKS + main_menu_keyboard
+        return await insta_entry(client, message, clean_insta_url(text), USER_TASKS, main_menu_keyboard)
 
     # ✅ Auto detect YouTube
     if is_youtube_url(text):
@@ -192,8 +198,8 @@ async def text_handler(client, message):
     if state == "WAIT_URL":
         return await url_flow(client, message, text)
 
-    # In other cases show menu
     return await message.reply("❌ Menu select cheyyu ✅", reply_markup=main_menu_keyboard())
+
 
 # ===========================
 # FILE HANDLER (compressor)
@@ -207,6 +213,7 @@ async def file_handler(client, message):
         return await compressor_entry(client, message)
 
     await message.reply("❌ Send URL / or select menu ✅", reply_markup=main_menu_keyboard())
+
 
 # ===========================
 # RUN
