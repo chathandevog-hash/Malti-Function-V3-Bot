@@ -6,8 +6,6 @@ import subprocess
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from pyrogram.errors import FloodWait
 
-DOWNLOAD_DIR = os.getenv("DOWNLOAD_DIR", "downloads")
-
 try:
     from bot import USER_CANCEL
 except:
@@ -17,10 +15,13 @@ except:
 def is_terabox_url(text: str) -> bool:
     if not text:
         return False
-    text = text.lower()
-    return ("terabox" in text) and (text.startswith("http://") or text.startswith("https://"))
+    t = text.lower().strip()
+    return (t.startswith("http://") or t.startswith("https://")) and ("terabox" in t)
 
 
+# ===============================
+# FLOOD SAFE HELPERS ✅
+# ===============================
 async def safe_send(message, text, reply_markup=None):
     while True:
         try:
@@ -64,7 +65,7 @@ async def progress_anim(uid: int, status_msg, label: str):
         if uid in USER_CANCEL:
             return
         now = time.time()
-        if now - last > 10:
+        if now - last > 10:  # ✅ safe interval
             last = now
             step += 1
             await safe_edit(
@@ -78,27 +79,28 @@ async def progress_anim(uid: int, status_msg, label: str):
         await asyncio.sleep(1)
 
 
-async def terabox_download(url: str, uid: int):
-    os.makedirs(DOWNLOAD_DIR, exist_ok=True)
-
-    outtmpl = os.path.join(DOWNLOAD_DIR, f"terabox_{uid}_{int(time.time())}.%(ext)s")
-
+# ===============================
+# ✅ Extract direct URL only (No download)
+# ===============================
+async def terabox_extract_direct_url(url: str, uid: int) -> str:
+    """
+    Uses yt-dlp -g to extract direct stream URL.
+    This does NOT download file. Only returns a direct URL.
+    """
     cmd = [
         "yt-dlp",
         "--no-playlist",
         "--no-warnings",
         "--socket-timeout", "20",
         "--retries", "3",
-        "-f", "bv*+ba/best",
-        "--merge-output-format", "mp4",
-        "-o", outtmpl,
+        "-g",
         url
     ]
 
     proc = await asyncio.create_subprocess_exec(
         *cmd,
         stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.STDOUT
+        stderr=asyncio.subprocess.PIPE
     )
 
     while True:
@@ -108,27 +110,28 @@ async def terabox_download(url: str, uid: int):
             except:
                 pass
             raise asyncio.CancelledError
-
-        line = await proc.stdout.readline()
-        if not line:
+        if proc.returncode is not None:
             break
+        await asyncio.sleep(0.5)
 
-    await proc.wait()
+    out, err = await proc.communicate()
     if proc.returncode != 0:
-        raise Exception("Terabox download failed")
+        raise Exception("Terabox direct link extract failed")
 
-    mp4_path = outtmpl.replace("%(ext)s", "mp4")
-    if os.path.exists(mp4_path):
-        return mp4_path
+    lines = out.decode(errors="ignore").strip().splitlines()
+    if not lines:
+        raise Exception("No direct link found")
 
-    # fallback scan
-    files = [f for f in os.listdir(DOWNLOAD_DIR) if f.startswith(f"terabox_{uid}_")]
-    if not files:
-        raise Exception("Downloaded file not found")
-    files.sort(key=lambda x: os.path.getmtime(os.path.join(DOWNLOAD_DIR, x)), reverse=True)
-    return os.path.join(DOWNLOAD_DIR, files[0])
+    direct = lines[0].strip()
+    if not direct.startswith("http"):
+        raise Exception("Invalid direct link")
+
+    return direct
 
 
+# ===============================
+# ENTRY
+# ===============================
 async def terabox_entry(client, message, url: str, USER_TASKS, main_menu_keyboard):
     uid = message.from_user.id
 
@@ -137,25 +140,28 @@ async def terabox_entry(client, message, url: str, USER_TASKS, main_menu_keyboar
         return
 
     async def job():
-        path = None
         anim = None
         try:
             USER_CANCEL.discard(uid)
 
-            anim = asyncio.create_task(progress_anim(uid, status, "Downloading from Terabox..."))
-            path = await terabox_download(url, uid)
+            # ✅ Step 1: Extract direct stream url
+            anim = asyncio.create_task(progress_anim(uid, status, "Extracting direct link..."))
+            direct_url = await terabox_extract_direct_url(url, uid)
 
             if anim and not anim.done():
                 anim.cancel()
 
-            anim = asyncio.create_task(progress_anim(uid, status, "Uploading..."))
+            if uid in USER_CANCEL:
+                raise asyncio.CancelledError
 
-            await client.send_video(
-                chat_id=message.chat.id,
-                video=path,
-                caption="✅ Terabox Video 🎥",
-                supports_streaming=True
-            )
+            # ✅ Step 2: Auto URL Uploader (User won't see direct link)
+            anim = asyncio.create_task(progress_anim(uid, status, "Uploading video..."))
+
+            # Import URL uploader flow inside function to avoid circular imports
+            from url import url_flow
+
+            # call url uploader silently
+            await url_flow(client, message, direct_url)
 
             if anim and not anim.done():
                 anim.cancel()
@@ -180,10 +186,5 @@ async def terabox_entry(client, message, url: str, USER_TASKS, main_menu_keyboar
 
         finally:
             USER_CANCEL.discard(uid)
-            try:
-                if path and os.path.exists(path):
-                    os.remove(path)
-            except:
-                pass
 
     USER_TASKS[uid] = asyncio.create_task(job())
