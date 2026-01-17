@@ -99,6 +99,45 @@ async def safe_edit(msg, text, reply_markup=None):
 
 
 # ==========================
+# ✅ FASTSTART FIX (Smooth streaming)
+# ==========================
+async def mp4_faststart(input_path: str, status_msg=None):
+    """
+    Fix Telegram seek issue by moving moov atom to beginning (no re-encode).
+    Works only for mp4.
+    """
+    if not input_path.lower().endswith(".mp4"):
+        return input_path
+
+    out_path = os.path.splitext(input_path)[0] + "_fast.mp4"
+    if os.path.exists(out_path):
+        return out_path
+
+    if status_msg:
+        await safe_edit(status_msg, "⚡ Optimizing for smooth streaming...\n`FastStart enabled`")
+
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", input_path,
+        "-c", "copy",
+        "-movflags", "+faststart",
+        out_path
+    ]
+
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.DEVNULL
+    )
+    await proc.wait()
+
+    if os.path.exists(out_path) and os.path.getsize(out_path) > 1024:
+        return out_path
+
+    return input_path
+
+
+# ==========================
 # THUMBNAIL (middle frame)
 # ==========================
 def get_video_duration(path: str):
@@ -273,6 +312,7 @@ async def url_callback_router(client, cb, USER_TASKS, USER_CANCEL, get_or_create
     async def job():
         file_path = None
         thumb = None
+        fast_path = None
         try:
             USER_CANCEL.discard(uid)
             kb_cancel = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_{uid}")]])
@@ -288,20 +328,24 @@ async def url_callback_router(client, cb, USER_TASKS, USER_CANCEL, get_or_create
             if uid in USER_CANCEL:
                 raise asyncio.CancelledError
 
-            size = os.path.getsize(file_path)
+            # ✅ smooth streaming fix for mp4
+            fast_path = await mp4_faststart(file_path, status_msg=status)
+            upload_file = fast_path if fast_path else file_path
+
+            size = os.path.getsize(upload_file)
             up_start = time.time()
 
             if mode == "video":
-                thumb = os.path.splitext(file_path)[0] + "_thumb.jpg"
+                thumb = os.path.splitext(upload_file)[0] + "_thumb.jpg"
                 try:
-                    await gen_thumbnail(file_path, thumb)
+                    await gen_thumbnail(upload_file, thumb)
                 except:
                     thumb = None
 
                 await safe_edit(status, "📤 Uploading...", kb_cancel)
                 await client.send_video(
                     chat_id=cb.message.chat.id,
-                    video=file_path,
+                    video=upload_file,
                     caption=f"✅ Uploaded 🎥\n\n📌 `{fname_clean}`\n📦 {naturalsize(size)}",
                     supports_streaming=True,
                     thumb=thumb if thumb and os.path.exists(thumb) else None,
@@ -312,7 +356,7 @@ async def url_callback_router(client, cb, USER_TASKS, USER_CANCEL, get_or_create
                 await safe_edit(status, "📤 Uploading...", kb_cancel)
                 await client.send_document(
                     chat_id=cb.message.chat.id,
-                    document=file_path,
+                    document=upload_file,
                     caption=f"✅ Uploaded 📁\n\n📌 `{fname_clean}`\n📦 {naturalsize(size)}",
                     progress=upload_progress,
                     progress_args=(status, uid, up_start, USER_CANCEL)
@@ -327,15 +371,12 @@ async def url_callback_router(client, cb, USER_TASKS, USER_CANCEL, get_or_create
         finally:
             URL_STATE.pop(uid, None)
             USER_CANCEL.discard(uid)
-            try:
-                if thumb and os.path.exists(thumb):
-                    os.remove(thumb)
-            except:
-                pass
-            try:
-                if file_path and os.path.exists(file_path):
-                    os.remove(file_path)
-            except:
-                pass
+
+            for p in [thumb, fast_path, file_path]:
+                try:
+                    if p and os.path.exists(p):
+                        os.remove(p)
+                except:
+                    pass
 
     USER_TASKS[uid] = asyncio.create_task(job())
