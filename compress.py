@@ -1,32 +1,37 @@
 import os
-import re
 import time
 import asyncio
 import aiohttp
+import humanize
 
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 
-# ==========================
-# CONFIG
-# ==========================
 DOWNLOAD_DIR = os.getenv("DOWNLOAD_DIR", "downloads")
 CLOUDCONVERT_API_BASE = "https://api.cloudconvert.com/v2"
 
 HIGH_QUALITIES = ["1080p", "720p", "480p"]
 LOW_QUALITIES = ["360p", "240p", "144p"]
 
-COMPRESS_STATE = {}  # uid -> {"msg_id": int, "mode": str, "quality": str}
+COMPRESS_STATE = {}  # uid -> {"msg_id": int, "mode": str}
 
 
 # ==========================
-# UTILS
+# UI UTILS
 # ==========================
 async def safe_edit(msg, text, reply_markup=None):
     try:
         await msg.edit(text, reply_markup=reply_markup)
     except:
         pass
+
+
+def naturalsize(b: int):
+    try:
+        return humanize.naturalsize(b, binary=True)
+    except:
+        return str(b)
+
 
 def make_circle_bar(percent: float, slots: int = 14):
     percent = max(0, min(100, percent))
@@ -47,8 +52,25 @@ def make_circle_bar(percent: float, slots: int = 14):
 
     return f"[{icon * filled}{'⚪' * (slots - filled)}]"
 
+
+def make_progress_text(title, current, total, speed, eta):
+    percent = (current / total * 100) if total else 0
+    bar = make_circle_bar(percent)
+    speed_str = naturalsize(int(speed)) + "/s" if speed else "0 B/s"
+
+    return (
+        f"✨ **{title}**\n\n"
+        f"{bar}\n\n"
+        f"📊 Progress: **{percent:.2f}%**\n"
+        f"📦 Size: **{naturalsize(current)} / {naturalsize(total) if total else 'Unknown'}**\n"
+        f"⚡ Speed: **{speed_str}**\n"
+        f"⏳ ETA: **{int(eta)}s**"
+    )
+
+
 def get_cloudconvert_key():
     return os.getenv("CLOUDCONVERT_API_KEY", "").strip()
+
 
 def compressor_menu_kb():
     return InlineKeyboardMarkup([
@@ -58,6 +80,7 @@ def compressor_menu_kb():
         ],
         [InlineKeyboardButton("⬅️ Back", callback_data="back_main")]
     ])
+
 
 def quality_kb(mode: str):
     qualities = HIGH_QUALITIES if mode == "high" else LOW_QUALITIES
@@ -75,6 +98,31 @@ def quality_kb(mode: str):
 
 
 # ==========================
+# TELEGRAM DOWNLOAD PROGRESS
+# ==========================
+async def tg_download_progress(current, total, status_msg, uid, start_time, USER_CANCEL):
+    if uid in USER_CANCEL:
+        raise asyncio.CancelledError
+
+    elapsed = time.time() - start_time
+    speed = current / elapsed if elapsed > 0 else 0
+    eta = (total - current) / speed if speed > 0 else 0
+
+    now = time.time()
+    if not hasattr(status_msg, "_last_edit"):
+        status_msg._last_edit = 0
+
+    if now - status_msg._last_edit > 2:
+        status_msg._last_edit = now
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_{uid}")]])
+        await safe_edit(
+            status_msg,
+            make_progress_text("⬇️ Downloading from Telegram", current, total, speed, eta),
+            kb
+        )
+
+
+# ==========================
 # CLOUDCONVERT
 # ==========================
 async def cloudconvert_create_job(session: aiohttp.ClientSession, api_key: str, quality: str):
@@ -86,6 +134,7 @@ async def cloudconvert_create_job(session: aiohttp.ClientSession, api_key: str, 
     }
     height = height_map.get(quality, 360)
 
+    # ✅ FIXED: remove unsupported "engine"
     payload = {
         "tasks": {
             "import-1": {"operation": "import/upload"},
@@ -94,7 +143,6 @@ async def cloudconvert_create_job(session: aiohttp.ClientSession, api_key: str, 
                 "input": "import-1",
                 "input_format": "auto",
                 "output_format": "mp4",
-                "engine": "ffmpeg",
                 "video_codec": "x264",
                 "crf": 28,
                 "height": height,
@@ -111,12 +159,14 @@ async def cloudconvert_create_job(session: aiohttp.ClientSession, api_key: str, 
             raise Exception(f"CloudConvert API Error ({r.status}): {data}")
         return data
 
+
 def extract_upload_form(job_json: dict):
     tasks = job_json.get("data", {}).get("tasks", [])
     for t in tasks:
         if t.get("operation") == "import/upload":
             return t.get("result", {}).get("form")
     return None
+
 
 def extract_export_url(job_json: dict):
     tasks = job_json.get("data", {}).get("tasks", [])
@@ -126,6 +176,7 @@ def extract_export_url(job_json: dict):
             if files:
                 return files[0].get("url")
     return None
+
 
 async def cloudconvert_upload(session: aiohttp.ClientSession, upload_form: dict, file_path: str):
     url = upload_form.get("url")
@@ -142,6 +193,7 @@ async def cloudconvert_upload(session: aiohttp.ClientSession, upload_form: dict,
         if r.status >= 400:
             txt = await r.text()
             raise Exception(f"Upload failed HTTP {r.status}: {txt}")
+
 
 async def cloudconvert_wait(session: aiohttp.ClientSession, api_key: str, job_id: str, status_msg, uid, USER_CANCEL):
     headers = {"Authorization": f"Bearer {api_key}"}
@@ -172,7 +224,6 @@ async def cloudconvert_wait(session: aiohttp.ClientSession, api_key: str, job_id
 
         if job_json.get("data", {}).get("status") == "finished":
             return job_json
-
         if job_json.get("data", {}).get("status") == "error":
             raise Exception("CloudConvert job failed")
 
@@ -184,7 +235,6 @@ async def cloudconvert_wait(session: aiohttp.ClientSession, api_key: str, job_id
 # ==========================
 async def compressor_entry(client, message):
     uid = message.from_user.id
-
     media = message.video or message.document
     if not media:
         return await message.reply("❌ Send a video or file.")
@@ -195,6 +245,7 @@ async def compressor_entry(client, message):
         "🗜️ **Compressor**\n\nChoose mode 👇",
         reply_markup=compressor_menu_kb()
     )
+
 
 async def compressor_callback_router(client, cb, USER_TASKS, USER_CANCEL, get_or_create_status, main_menu_keyboard, DOWNLOAD_DIR):
     uid = cb.from_user.id
@@ -238,7 +289,6 @@ async def compressor_callback_router(client, cb, USER_TASKS, USER_CANCEL, get_or
                 if not api_key:
                     raise Exception("CLOUDCONVERT_API_KEY missing in env")
 
-                # find original media message by msg_id
                 media_msg = await client.get_messages(cb.message.chat.id, msg_id)
                 media = media_msg.video or media_msg.document
                 if not media:
@@ -247,8 +297,15 @@ async def compressor_callback_router(client, cb, USER_TASKS, USER_CANCEL, get_or
                 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
                 input_path = os.path.join(DOWNLOAD_DIR, f"cmp_{uid}_{int(time.time())}_{media.file_unique_id}.bin")
 
+                # ✅ Telegram download with progress bar
                 await safe_edit(status, "⬇️ Downloading from Telegram...", kb)
-                await client.download_media(media_msg, file_name=input_path)
+                dl_start = time.time()
+                await client.download_media(
+                    media_msg,
+                    file_name=input_path,
+                    progress=tg_download_progress,
+                    progress_args=(status, uid, dl_start, USER_CANCEL)
+                )
 
                 await safe_edit(status, "☁️ Creating cloud job...", kb)
 
@@ -286,6 +343,7 @@ async def compressor_callback_router(client, cb, USER_TASKS, USER_CANCEL, get_or
                 await safe_edit(status, f"❌ Failed!\n\nError: `{e}`", reply_markup=main_menu_keyboard())
             finally:
                 USER_CANCEL.discard(uid)
+                COMPRESS_STATE.pop(uid, None)
                 try:
                     if input_path and os.path.exists(input_path):
                         os.remove(input_path)
