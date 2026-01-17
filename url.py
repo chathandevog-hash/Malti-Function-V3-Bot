@@ -10,19 +10,17 @@ from urllib.parse import urlparse, unquote
 
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
+DOWNLOAD_DIR = os.getenv("DOWNLOAD_DIR", "downloads")
 
-# ==========================
-# LIMITS
-# ==========================
 URL_UPLOAD_LIMIT = 2 * 1024 * 1024 * 1024  # 2GB
 CHUNK_SIZE = 1024 * 256
 
+URL_STATE = {}  # uid -> url
 
-# ==========================
-# UTILS
-# ==========================
+
 def is_url(text: str):
     return (text or "").startswith("http://") or (text or "").startswith("https://")
+
 
 def naturalsize(num_bytes: int):
     if num_bytes is None:
@@ -31,12 +29,14 @@ def naturalsize(num_bytes: int):
         return "0 B"
     return humanize.naturalsize(num_bytes, binary=True)
 
+
 def safe_filename(name: str):
     name = re.sub(r"[\\/:*?\"<>|]", "_", name)
     name = name.strip().strip(".")
     if not name:
         name = f"file_{int(time.time())}"
     return name[:180]
+
 
 def clean_display_name(name: str):
     base = os.path.splitext(name)[0]
@@ -45,6 +45,7 @@ def clean_display_name(name: str):
     if len(base) > 60:
         base = base[:60].rstrip("_")
     return base or f"file_{int(time.time())}"
+
 
 def format_time(seconds: float):
     if seconds <= 0:
@@ -57,6 +58,7 @@ def format_time(seconds: float):
     if m:
         return f"{m}m {s}s"
     return f"{s}s"
+
 
 def make_circle_bar(percent: float, slots: int = 14):
     percent = max(0, min(100, percent))
@@ -77,6 +79,7 @@ def make_circle_bar(percent: float, slots: int = 14):
 
     return f"[{icon * filled}{'⚪' * (slots - filled)}]"
 
+
 def make_progress_text(title, done, total, speed, eta):
     percent = (done / total * 100) if total else 0
     bar = make_circle_bar(percent)
@@ -91,6 +94,7 @@ def make_progress_text(title, done, total, speed, eta):
         f"⏳ ETA: **{format_time(eta)}**"
     )
 
+
 async def safe_edit(msg, text, reply_markup=None):
     try:
         await msg.edit(text, reply_markup=reply_markup)
@@ -98,9 +102,6 @@ async def safe_edit(msg, text, reply_markup=None):
         pass
 
 
-# ==========================
-# URL INFO
-# ==========================
 async def get_filename_and_size(url: str):
     filename = None
     total = 0
@@ -128,9 +129,6 @@ async def get_filename_and_size(url: str):
     return safe_filename(filename), total
 
 
-# ==========================
-# DOWNLOAD STREAM
-# ==========================
 async def download_stream(url, file_path, status_msg, uid, USER_CANCEL: set):
     USER_CANCEL.discard(uid)
     timeout = aiohttp.ClientTimeout(total=None)
@@ -166,7 +164,7 @@ async def download_stream(url, file_path, status_msg, uid, USER_CANCEL: set):
                     speed = downloaded / elapsed if elapsed > 0 else 0
                     eta = (total - downloaded) / speed if total and speed > 0 else 0
 
-                    if time.time() - last_edit > 2:
+                    if time.time() - last_edit > 6:
                         last_edit = time.time()
                         kb = InlineKeyboardMarkup([
                             [InlineKeyboardButton("❌ Cancel Download", callback_data=f"cancel_{uid}")]
@@ -177,16 +175,8 @@ async def download_stream(url, file_path, status_msg, uid, USER_CANCEL: set):
                             reply_markup=kb
                         )
 
-    return downloaded, total
 
-
-# ==========================
-# VIDEO META (for exact preview)
-# ==========================
 def ffprobe_video_info(path: str):
-    """
-    returns (duration_sec, w, h)
-    """
     try:
         p = subprocess.run(
             [
@@ -212,7 +202,7 @@ def ffprobe_video_info(path: str):
 
 async def gen_thumbnail(input_path: str, out_thumb: str):
     dur, _, _ = ffprobe_video_info(input_path)
-    ss = dur // 2 if dur and dur > 8 else 3  # ✅ middle frame
+    ss = dur // 2 if dur and dur > 8 else 3
     cmd = [
         "ffmpeg", "-y",
         "-ss", str(ss),
@@ -232,16 +222,13 @@ async def gen_thumbnail(input_path: str, out_thumb: str):
 
 
 async def fix_faststart(input_path: str, status_msg=None):
-    """
-    ✅ Fix streaming seek issue: move moov atom to beginning
-    """
     if not input_path.lower().endswith(".mp4"):
         return input_path
 
     out_path = os.path.splitext(input_path)[0] + "_fast.mp4"
 
     if status_msg:
-        await safe_edit(status_msg, "⚡ Fixing Streaming (Keyframes + FastStart)...\n⏳ Please wait...")
+        await safe_edit(status_msg, "⚡ Fixing Streaming (FastStart)...\n⏳ Please wait...")
 
     cmd = [
         "ffmpeg", "-y",
@@ -265,3 +252,105 @@ async def fix_faststart(input_path: str, status_msg=None):
         return out_path
 
     return input_path
+
+
+# ==========================
+# PUBLIC API FOR bot.py
+# ==========================
+async def url_flow(client, message, url: str):
+    uid = message.from_user.id
+    URL_STATE[uid] = url
+
+    kb = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("🎥 Video Upload", callback_data="url_send_video"),
+            InlineKeyboardButton("📁 File Upload", callback_data="url_send_file"),
+        ],
+        [InlineKeyboardButton("⬅️ Back", callback_data="back_main")]
+    ])
+    await message.reply("✅ URL Detected 🌐\n\n👇 Choose upload type:", reply_markup=kb)
+
+
+async def url_callback_router(client, cb, USER_TASKS, USER_CANCEL, get_or_create_status, main_menu_keyboard, DOWNLOAD_DIR):
+    uid = cb.from_user.id
+    data = cb.data
+
+    if uid not in URL_STATE:
+        return await cb.message.edit("❌ Session expired. Send URL again.", reply_markup=main_menu_keyboard())
+
+    url = URL_STATE[uid]
+    mode = "video" if data == "url_send_video" else "file"
+
+    await cb.answer()
+    status = await get_or_create_status(cb.message, uid)
+
+    async def job():
+        file_path = None
+        thumb = None
+        try:
+            USER_CANCEL.discard(uid)
+
+            fname, _ = await get_filename_and_size(url)
+            name_clean = clean_display_name(fname)
+
+            file_path = os.path.join(DOWNLOAD_DIR, f"url_{uid}_{int(time.time())}_{fname}")
+
+            await safe_edit(status, "⬇️ Starting download...")
+            await download_stream(url, file_path, status, uid, USER_CANCEL)
+
+            if uid in USER_CANCEL:
+                raise asyncio.CancelledError
+
+            upload_path = file_path
+
+            if mode == "video" and file_path.lower().endswith(".mp4"):
+                upload_path = await fix_faststart(file_path, status)
+
+            size = os.path.getsize(upload_path)
+
+            if mode == "video":
+                thumb = os.path.splitext(upload_path)[0] + "_thumb.jpg"
+                try:
+                    await gen_thumbnail(upload_path, thumb)
+                except:
+                    thumb = None
+
+                dur, w, h = ffprobe_video_info(upload_path)
+
+                args = {}
+                if dur > 0: args["duration"] = dur
+                if w > 0: args["width"] = w
+                if h > 0: args["height"] = h
+
+                await client.send_video(
+                    chat_id=cb.message.chat.id,
+                    video=upload_path,
+                    caption=f"✅ Uploaded 🎥\n\n📌 `{name_clean}`\n📦 {naturalsize(size)}",
+                    supports_streaming=True,
+                    thumb=thumb if thumb and os.path.exists(thumb) else None,
+                    **args
+                )
+            else:
+                await client.send_document(
+                    chat_id=cb.message.chat.id,
+                    document=upload_path,
+                    caption=f"✅ Uploaded 📁\n\n📌 `{name_clean}`\n📦 {naturalsize(size)}"
+                )
+
+            await safe_edit(status, "✅ Done ✅", reply_markup=main_menu_keyboard())
+
+        except asyncio.CancelledError:
+            await safe_edit(status, "❌ Cancelled ✅", reply_markup=main_menu_keyboard())
+        except Exception as e:
+            await safe_edit(status, f"❌ URL Upload Failed!\n\nError: `{e}`", reply_markup=main_menu_keyboard())
+        finally:
+            URL_STATE.pop(uid, None)
+            USER_CANCEL.discard(uid)
+            for p in [thumb, file_path]:
+                try:
+                    if p and os.path.exists(p):
+                        os.remove(p)
+                except:
+                    pass
+
+    USER_TASKS[uid] = asyncio.create_task(job())
