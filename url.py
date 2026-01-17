@@ -80,33 +80,16 @@ def make_circle_bar(percent: float, slots: int = 14):
     return f"[{icon * filled}{'⚪' * (slots - filled)}]"
 
 
-def spinner_frame(tick: int):
-    frames = ["⠁", "⠃", "⠇", "⠧", "⠷", "⠿", "⠟", "⠯"]
-    return frames[tick % len(frames)]
-
-
-def make_progress_text(title, done, total, speed, eta, tick=0):
-    speed_str = naturalsize(int(speed)) + "/s" if speed else "0 B/s"
-
-    # ✅ total unknown → no % based bar
-    if not total or total <= 0:
-        spin = spinner_frame(tick)
-        return (
-            f"✨ **{title}**\n\n"
-            f"{spin} Downloading... (Unknown total size)\n\n"
-            f"📦 Downloaded: **{naturalsize(done)}**\n"
-            f"⚡ Speed: **{speed_str}**\n"
-            f"⏳ ETA: **Unknown**"
-        )
-
+def make_progress_text(title, done, total, speed, eta):
     percent = (done / total * 100) if total else 0
     bar = make_circle_bar(percent)
+    speed_str = naturalsize(int(speed)) + "/s" if speed else "0 B/s"
 
     return (
         f"✨ **{title}**\n\n"
         f"{bar}\n\n"
         f"📊 Progress: **{percent:.2f}%**\n"
-        f"📦 Size: **{naturalsize(done)} / {naturalsize(total)}**\n"
+        f"📦 Size: **{naturalsize(done)} / {naturalsize(total) if total else 'Unknown'}**\n"
         f"⚡ Speed: **{speed_str}**\n"
         f"⏳ ETA: **{format_time(eta)}**"
     )
@@ -179,7 +162,6 @@ async def download_stream(url, file_path, status_msg, uid, USER_CANCEL: set):
     start_time = time.time()
     last_edit = 0
     total = 0
-    tick = 0
 
     async with aiohttp.ClientSession(timeout=timeout) as session:
         async with session.get(url, allow_redirects=True) as r:
@@ -189,7 +171,6 @@ async def download_stream(url, file_path, status_msg, uid, USER_CANCEL: set):
             if r.headers.get("Content-Length"):
                 total = int(r.headers.get("Content-Length"))
 
-            # ✅ enforce limit only if total is known
             if total and total > URL_UPLOAD_LIMIT:
                 raise Exception("❌ URL file too large (max 2GB)")
 
@@ -198,7 +179,7 @@ async def download_stream(url, file_path, status_msg, uid, USER_CANCEL: set):
             kb0 = InlineKeyboardMarkup([
                 [InlineKeyboardButton("❌ Cancel Download", callback_data=f"cancel_{uid}")]
             ])
-            await safe_edit(status_msg, make_progress_text("⬇️ Downloading...", 0, total, 0, 0, tick=tick), reply_markup=kb0)
+            await safe_edit(status_msg, make_progress_text("⬇️ Downloading...", 0, total, 0, 0), reply_markup=kb0)
 
             with open(file_path, "wb") as f:
                 async for chunk in r.content.iter_chunked(CHUNK_SIZE):
@@ -206,28 +187,21 @@ async def download_stream(url, file_path, status_msg, uid, USER_CANCEL: set):
                         raise asyncio.CancelledError
                     if not chunk:
                         continue
-
                     f.write(chunk)
                     downloaded += len(chunk)
-
-                    # ✅ extra safety: hard cap download when total unknown
-                    if (not total) and downloaded > URL_UPLOAD_LIMIT:
-                        raise Exception("❌ URL file exceeded 2GB limit while downloading")
 
                     elapsed = time.time() - start_time
                     speed = downloaded / elapsed if elapsed > 0 else 0
                     eta = (total - downloaded) / speed if total and speed > 0 else 0
 
-                    # ✅ update every 3 sec
                     if time.time() - last_edit > 3:
                         last_edit = time.time()
-                        tick += 1
                         kb = InlineKeyboardMarkup([
                             [InlineKeyboardButton("❌ Cancel Download", callback_data=f"cancel_{uid}")]
                         ])
                         await safe_edit(
                             status_msg,
-                            make_progress_text("⬇️ Downloading...", downloaded, total, speed, eta, tick=tick),
+                            make_progress_text("⬇️ Downloading...", downloaded, total, speed, eta),
                             reply_markup=kb
                         )
 
@@ -277,38 +251,75 @@ async def gen_thumbnail(input_path: str, out_thumb: str):
     return os.path.exists(out_thumb)
 
 
-async def fix_faststart(input_path: str, status_msg=None):
+# ✅ This fixes seek bug (faststart + keyframes)
+async def fix_streaming_seek(input_path: str, status_msg, uid, USER_CANCEL: set):
     if not input_path.lower().endswith(".mp4"):
         return input_path
 
-    out_path = os.path.splitext(input_path)[0] + "_fast.mp4"
+    out_path = os.path.splitext(input_path)[0] + "_stream.mp4"
 
-    if status_msg:
-        kb = InlineKeyboardMarkup([[InlineKeyboardButton("⏳ Please wait", callback_data="noop")]])
-        await safe_edit(status_msg, "⚡ Fixing Streaming (FastStart)...\n⏳ Please wait...", reply_markup=kb)
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_{uid}")]])
+    await safe_edit(status_msg, "⚡ Fixing Streaming (Keyframes + FastStart)...\n⏳ Please wait...", reply_markup=kb)
 
+    # ✅ re-encode to ensure keyframes
     cmd = [
         "ffmpeg", "-y",
         "-i", input_path,
-        "-c", "copy",
+        "-c:v", "libx264",
+        "-preset", "veryfast",
+        "-crf", "23",
+        "-g", "48",
+        "-keyint_min", "48",
+        "-sc_threshold", "0",
+        "-c:a", "aac",
+        "-b:a", "128k",
         "-movflags", "+faststart",
         out_path
     ]
+
     proc = await asyncio.create_subprocess_exec(
         *cmd,
-        stdout=asyncio.subprocess.DEVNULL,
-        stderr=asyncio.subprocess.DEVNULL
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT
     )
+
+    # ✅ minimal progress animation (avoid floodwait)
+    tick = 0
+    last_edit = 0
+
+    while True:
+        if uid in USER_CANCEL:
+            try:
+                proc.kill()
+            except:
+                pass
+            raise asyncio.CancelledError
+
+        line = await proc.stdout.readline()
+        if not line:
+            break
+
+        if time.time() - last_edit > 6:
+            last_edit = time.time()
+            tick += 1
+            await safe_edit(
+                status_msg,
+                f"⚡ Fixing Streaming...\n\n{make_circle_bar((tick % 14) * (100/14))}\n\n⏳ Please wait...",
+                reply_markup=kb
+            )
+
     await proc.wait()
 
-    if os.path.exists(out_path):
-        try:
-            os.remove(input_path)
-        except:
-            pass
-        return out_path
+    if proc.returncode != 0 or not os.path.exists(out_path):
+        # fallback: original
+        return input_path
 
-    return input_path
+    try:
+        os.remove(input_path)
+    except:
+        pass
+
+    return out_path
 
 
 # ==========================
@@ -360,9 +371,9 @@ async def url_callback_router(client, cb, USER_TASKS, USER_CANCEL, get_or_create
 
             upload_path = file_path
 
-            # ✅ faststart optimize
+            # ✅ Fix seek bug for MP4 streaming
             if mode == "video" and file_path.lower().endswith(".mp4"):
-                upload_path = await fix_faststart(file_path, status)
+                upload_path = await fix_streaming_seek(file_path, status, uid, USER_CANCEL)
 
             size = os.path.getsize(upload_path)
             up_start = time.time()
