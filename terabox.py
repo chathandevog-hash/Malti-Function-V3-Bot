@@ -1,7 +1,7 @@
 import os
 import time
 import asyncio
-import subprocess
+import aiohttp
 
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from pyrogram.errors import FloodWait
@@ -80,53 +80,75 @@ async def progress_anim(uid: int, status_msg, label: str):
 
 
 # ===============================
-# ✅ Extract direct URL only (No download)
+# ✅ RapidAPI direct URL extraction (NO yt-dlp) ✅
 # ===============================
 async def terabox_extract_direct_url(url: str, uid: int) -> str:
     """
-    Uses yt-dlp -g to extract direct stream URL.
-    This does NOT download file. Only returns a direct URL.
+    Uses RapidAPI Terabox Direct Link Generator.
+    Returns direct download url (mp4).
     """
-    cmd = [
-        "yt-dlp",
-        "--no-playlist",
-        "--no-warnings",
-        "--socket-timeout", "20",
-        "--retries", "3",
-        "-g",
-        url
-    ]
 
-    proc = await asyncio.create_subprocess_exec(
-        *cmd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE
-    )
+    RAPIDAPI_KEY = os.getenv("RAPIDAPI_KEY", "").strip()
+    RAPIDAPI_HOST = os.getenv("RAPIDAPI_HOST", "").strip()
 
-    while True:
-        if uid in USER_CANCEL:
+    if not RAPIDAPI_KEY or not RAPIDAPI_HOST:
+        raise Exception("RAPIDAPI_KEY / RAPIDAPI_HOST missing in env")
+
+    api_url = f"https://{RAPIDAPI_HOST}/fetch"
+
+    headers = {
+        "Content-Type": "application/json",
+        "x-rapidapi-host": RAPIDAPI_HOST,
+        "x-rapidapi-key": RAPIDAPI_KEY,
+    }
+
+    payload = {"url": url}
+
+    timeout = aiohttp.ClientTimeout(total=60)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.post(api_url, headers=headers, json=payload) as resp:
+            raw_text = await resp.text()
+            if resp.status != 200:
+                raise Exception(f"Terabox API HTTP {resp.status}: {raw_text}")
+
             try:
-                proc.kill()
+                data = await resp.json(content_type=None)
             except:
-                pass
-            raise asyncio.CancelledError
-        if proc.returncode is not None:
-            break
-        await asyncio.sleep(0.5)
+                raise Exception(f"Terabox API invalid JSON: {raw_text}")
 
-    out, err = await proc.communicate()
-    if proc.returncode != 0:
-        raise Exception("Terabox direct link extract failed")
+    # ✅ Parse possible fields
+    direct = None
 
-    lines = out.decode(errors="ignore").strip().splitlines()
-    if not lines:
-        raise Exception("No direct link found")
+    if isinstance(data, dict):
+        # format A
+        direct = data.get("download_url") or data.get("direct_url") or data.get("url")
 
-    direct = lines[0].strip()
-    if not direct.startswith("http"):
-        raise Exception("Invalid direct link")
+        # format B
+        if not direct and isinstance(data.get("data"), dict):
+            direct = (
+                data["data"].get("download_url")
+                or data["data"].get("direct_url")
+                or data["data"].get("url")
+            )
 
-    return direct
+        # format C
+        if not direct and isinstance(data.get("result"), dict):
+            direct = (
+                data["result"].get("download_url")
+                or data["result"].get("direct_url")
+                or data["result"].get("url")
+            )
+
+        # format D: list
+        if not direct and isinstance(data.get("data"), list) and len(data["data"]) > 0:
+            first = data["data"][0]
+            if isinstance(first, dict):
+                direct = first.get("download_url") or first.get("direct_url") or first.get("url")
+
+    if not direct or not str(direct).startswith("http"):
+        raise Exception(f"Terabox API no direct link: {data}")
+
+    return str(direct).strip()
 
 
 # ===============================
@@ -144,8 +166,8 @@ async def terabox_entry(client, message, url: str, USER_TASKS, main_menu_keyboar
         try:
             USER_CANCEL.discard(uid)
 
-            # ✅ Step 1: Extract direct stream url
-            anim = asyncio.create_task(progress_anim(uid, status, "Extracting direct link..."))
+            # ✅ Step 1: Extract direct url from API
+            anim = asyncio.create_task(progress_anim(uid, status, "Getting direct download link..."))
             direct_url = await terabox_extract_direct_url(url, uid)
 
             if anim and not anim.done():
@@ -157,10 +179,9 @@ async def terabox_entry(client, message, url: str, USER_TASKS, main_menu_keyboar
             # ✅ Step 2: Auto URL Uploader (User won't see direct link)
             anim = asyncio.create_task(progress_anim(uid, status, "Uploading video..."))
 
-            # Import URL uploader flow inside function to avoid circular imports
-            from url import url_flow
+            from url import url_flow  # avoid circular import
 
-            # call url uploader silently
+            # ✅ call URL uploader silently
             await url_flow(client, message, direct_url)
 
             if anim and not anim.done():
