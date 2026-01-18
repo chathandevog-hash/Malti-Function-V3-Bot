@@ -1,8 +1,11 @@
 import os
 import asyncio
+import time
 
 from pyrogram import Client, filters
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from pyrogram.errors import FloodWait
+from pyrogram.errors.exceptions.bad_request_400 import MessageNotModified
 
 from config import BOT_TOKEN, API_ID, API_HASH, DOWNLOAD_DIR
 
@@ -21,8 +24,47 @@ from terabox import is_terabox_url, terabox_entry
 # ===========================
 USER_TASKS = {}
 USER_CANCEL = set()
-USER_STATE = {}   # uid -> state string
-UI_STATUS_MSG = {}
+USER_STATE = {}          # uid -> state string
+UI_STATUS_MSG = {}       # uid -> status msg
+LAST_WARN = {}           # anti-spam warn
+LAST_MENU_EDIT = {}      # avoid repeated menu edits
+
+
+# ===========================
+# FLOOD SAFE HELPERS ✅
+# ===========================
+async def safe_send(message, text, reply_markup=None):
+    while True:
+        try:
+            return await message.reply(text, reply_markup=reply_markup)
+        except FloodWait as e:
+            await asyncio.sleep(int(e.value) + 1)
+        except:
+            return None
+
+
+async def safe_edit(msg, text, reply_markup=None):
+    if not msg:
+        return
+    while True:
+        try:
+            await msg.edit(text, reply_markup=reply_markup)
+            return
+        except MessageNotModified:
+            return
+        except FloodWait as e:
+            await asyncio.sleep(int(e.value) + 1)
+        except:
+            return
+
+
+async def safe_answer(cb, text="✅"):
+    try:
+        await cb.answer(text, show_alert=False)
+    except FloodWait as e:
+        await asyncio.sleep(int(e.value) + 1)
+    except:
+        pass
 
 
 # ===========================
@@ -32,7 +74,7 @@ async def get_or_create_status(message, uid):
     # ✅ always re-use one status msg per user (prevents flood)
     if uid in UI_STATUS_MSG:
         return UI_STATUS_MSG[uid]
-    status = await message.reply("⏳ Processing...")
+    status = await safe_send(message, "⏳ Processing...")
     UI_STATUS_MSG[uid] = status
     return status
 
@@ -92,15 +134,26 @@ app = Client(
 async def start_cmd(client, message):
     uid = message.from_user.id
     USER_STATE.pop(uid, None)
-    await message.reply(WELCOME_TEXT, reply_markup=main_menu_keyboard())
+    await safe_send(message, WELCOME_TEXT, reply_markup=main_menu_keyboard())
 
 
 @app.on_callback_query(filters.regex("^back_main$"))
 async def back_main(client, cb):
     uid = cb.from_user.id
     USER_STATE.pop(uid, None)
-    await cb.answer()
-    await cb.message.edit(WELCOME_TEXT, reply_markup=main_menu_keyboard())
+    await safe_answer(cb)
+    await safe_edit(cb.message, WELCOME_TEXT, reply_markup=main_menu_keyboard())
+
+
+# ===========================
+# MENU EDIT GUARD ✅
+# ===========================
+async def guarded_menu_edit(cb, uid, text):
+    # avoid re-editing same menu text repeatedly -> MessageNotModified + flood
+    if LAST_MENU_EDIT.get(uid) == text:
+        return
+    LAST_MENU_EDIT[uid] = text
+    await safe_edit(cb.message, text, reply_markup=back_keyboard())
 
 
 # ===========================
@@ -108,37 +161,42 @@ async def back_main(client, cb):
 # ===========================
 @app.on_callback_query(filters.regex("^menu_url$"))
 async def menu_url(client, cb):
-    USER_STATE[cb.from_user.id] = "WAIT_URL"
-    await cb.answer()
-    await cb.message.edit("🌐 **URL Uploader Mode**\n\nSend direct URL 👇", reply_markup=back_keyboard())
+    uid = cb.from_user.id
+    USER_STATE[uid] = "WAIT_URL"
+    await safe_answer(cb)
+    await guarded_menu_edit(cb, uid, "🌐 **URL Uploader Mode**\n\nSend direct URL 👇")
 
 
 @app.on_callback_query(filters.regex("^menu_compress$"))
 async def menu_compress(client, cb):
-    USER_STATE[cb.from_user.id] = "WAIT_COMPRESS"
-    await cb.answer()
-    await cb.message.edit("🗜️ **Compressor Mode**\n\nSend a Video/File 👇", reply_markup=back_keyboard())
+    uid = cb.from_user.id
+    USER_STATE[uid] = "WAIT_COMPRESS"
+    await safe_answer(cb)
+    await guarded_menu_edit(cb, uid, "🗜️ **Compressor Mode**\n\nSend a Video/File 👇")
 
 
 @app.on_callback_query(filters.regex("^menu_insta$"))
 async def menu_insta(client, cb):
-    USER_STATE[cb.from_user.id] = "WAIT_INSTA"
-    await cb.answer()
-    await cb.message.edit("📸 **Instagram Mode**\n\nSend Reel URL 👇", reply_markup=back_keyboard())
+    uid = cb.from_user.id
+    USER_STATE[uid] = "WAIT_INSTA"
+    await safe_answer(cb)
+    await guarded_menu_edit(cb, uid, "📸 **Instagram Mode**\n\nSend Reel URL 👇")
 
 
 @app.on_callback_query(filters.regex("^menu_youtube$"))
 async def menu_youtube(client, cb):
-    USER_STATE[cb.from_user.id] = "WAIT_YOUTUBE"
-    await cb.answer()
-    await cb.message.edit("▶️ **YouTube Mode**\n\nSend YouTube URL 👇", reply_markup=back_keyboard())
+    uid = cb.from_user.id
+    USER_STATE[uid] = "WAIT_YOUTUBE"
+    await safe_answer(cb)
+    await guarded_menu_edit(cb, uid, "▶️ **YouTube Mode**\n\nSend YouTube URL 👇")
 
 
 @app.on_callback_query(filters.regex("^menu_terabox$"))
 async def menu_terabox(client, cb):
-    USER_STATE[cb.from_user.id] = "WAIT_TERABOX"
-    await cb.answer()
-    await cb.message.edit("📦 **Terabox Mode**\n\nSend Terabox Link 👇", reply_markup=back_keyboard())
+    uid = cb.from_user.id
+    USER_STATE[uid] = "WAIT_TERABOX"
+    await safe_answer(cb)
+    await guarded_menu_edit(cb, uid, "📦 **Terabox Mode**\n\nSend Terabox Link 👇")
 
 
 # ===========================
@@ -149,7 +207,7 @@ async def cancel_task(client, cb):
     try:
         uid = int(cb.data.split("_", 1)[1])
     except:
-        return await cb.answer("Invalid", show_alert=True)
+        return await safe_answer(cb, "Invalid")
 
     USER_CANCEL.add(uid)
 
@@ -157,11 +215,8 @@ async def cancel_task(client, cb):
     if task and not task.done():
         task.cancel()
 
-    await cb.answer("✅ Cancelled!")
-    try:
-        await cb.message.edit("❌ Cancelled ✅", reply_markup=main_menu_keyboard())
-    except:
-        pass
+    await safe_answer(cb, "✅ Cancelled!")
+    await safe_edit(cb.message, "❌ Cancelled ✅", reply_markup=main_menu_keyboard())
 
 
 # ===========================
@@ -189,10 +244,7 @@ async def all_callbacks(client, cb):
             client, cb, USER_TASKS, USER_CANCEL, get_or_create_status, main_menu_keyboard, DOWNLOAD_DIR
         )
 
-    try:
-        await cb.answer("✅", show_alert=False)
-    except:
-        pass
+    await safe_answer(cb)
 
 
 # ===========================
@@ -231,19 +283,23 @@ async def text_handler(client, message):
     if state == "WAIT_TERABOX":
         if is_terabox_url(text):
             return await terabox_entry(client, message, text, USER_TASKS, main_menu_keyboard)
-        return await message.reply("❌ Terabox link ayakku bro ✅", reply_markup=back_keyboard())
+        return await safe_send(message, "❌ Terabox link ayakku bro ✅", reply_markup=back_keyboard())
 
     if state == "WAIT_INSTA":
         if is_instagram_url(text):
             return await insta_entry(client, message, clean_insta_url(text), USER_TASKS, main_menu_keyboard)
-        return await message.reply("❌ Instagram Reel link ayakku ✅", reply_markup=back_keyboard())
+        return await safe_send(message, "❌ Instagram Reel link ayakku ✅", reply_markup=back_keyboard())
 
     if state == "WAIT_YOUTUBE":
         if is_youtube_url(text):
             return await youtube_entry(client, message, clean_youtube_url(text))
-        return await message.reply("❌ YouTube link ayakku ✅", reply_markup=back_keyboard())
+        return await safe_send(message, "❌ YouTube link ayakku ✅", reply_markup=back_keyboard())
 
-    await message.reply("❌ Menu select cheyyu ✅", reply_markup=main_menu_keyboard())
+    # ✅ anti spam
+    now = time.time()
+    if now - LAST_WARN.get(uid, 0) > 15:
+        LAST_WARN[uid] = now
+        return await safe_send(message, "❌ Menu select cheyyu ✅", reply_markup=main_menu_keyboard())
 
 
 # ===========================
@@ -257,7 +313,10 @@ async def file_handler(client, message):
     if state == "WAIT_COMPRESS":
         return await compressor_entry(client, message)
 
-    await message.reply("❌ Send URL / or select menu ✅", reply_markup=main_menu_keyboard())
+    now = time.time()
+    if now - LAST_WARN.get(uid, 0) > 15:
+        LAST_WARN[uid] = now
+        return await safe_send(message, "❌ Send URL / or select menu ✅", reply_markup=main_menu_keyboard())
 
 
 # ===========================
