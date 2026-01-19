@@ -12,9 +12,6 @@ from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 SPOTIFY_STATE = {}  # uid -> spotify url
 
 
-# -------------------------
-# Utils
-# -------------------------
 def is_spotify_url(text: str):
     return bool(re.search(r"(open\.spotify\.com/(track|album|playlist)/|spotify:track:)", text or ""))
 
@@ -53,28 +50,20 @@ def nice_name(path: str):
     return base[:60]
 
 
-# -------------------------
-# Animated Processing Bar ✅
-# -------------------------
-async def animated_processing(status, title, steps=40, delay=0.3, cancel_kb=None):
+# ✅ LOOPING ANIMATION (never stuck UI)
+async def animated_processing(status, title, delay=0.3, cancel_kb=None):
     bar_len = 14
-    for i in range(steps):
-        filled = int((i / (steps - 1)) * bar_len)
+    i = 0
+    while True:
+        filled = i % (bar_len + 1)
         bar = "🟣" * filled + "⚪" * (bar_len - filled)
-
         text = f"{title}\n\n[{bar}]\n\n⏳ Please wait..."
         await safe_edit(status, text, reply_markup=cancel_kb)
         await asyncio.sleep(delay)
+        i += 1
 
 
-# -------------------------
-# Spotify metadata extract ✅ (Title + Artists)
-# -------------------------
 async def get_spotify_metadata(spotify_url: str):
-    """
-    Uses: spotdl save <url> --save-file
-    Returns dict: {title, artists, cover_url}
-    """
     if not _spotdl_ok():
         return {}
 
@@ -109,7 +98,6 @@ async def get_spotify_metadata(spotify_url: str):
             or ""
         )
 
-        # artists can be list
         if isinstance(artists, list):
             artists = ", ".join([str(x) for x in artists if x])
 
@@ -129,9 +117,6 @@ async def get_spotify_metadata(spotify_url: str):
             pass
 
 
-# -------------------------
-# Album Cover Fetch ✅
-# -------------------------
 async def fetch_album_cover_from_url(cover_url: str, save_path: str):
     try:
         if not cover_url:
@@ -151,17 +136,26 @@ async def fetch_album_cover_from_url(cover_url: str, save_path: str):
             return save_path
     except:
         return None
-
     return None
 
 
-# -------------------------
-# spotdl download
-# -------------------------
+def build_best_queries(title: str, artists: str):
+    title = (title or "").strip()
+    artists = (artists or "").strip()
+    if not title:
+        return []
+
+    base = f"{title} {artists}".strip()
+    return [
+        f"{base} audio",
+        f"{base} official audio",
+        f"{base} topic",
+        f"{base} lyrics",
+        f"{title} {artists} song",
+    ]
+
+
 async def download_with_spotdl(spotify_url: str, out_dir: str, timeout_sec=420):
-    """
-    Returns mp3_path or None
-    """
     if not _spotdl_ok():
         return None
 
@@ -171,35 +165,25 @@ async def download_with_spotdl(spotify_url: str, out_dir: str, timeout_sec=420):
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE
     )
-
     try:
         await asyncio.wait_for(proc.communicate(), timeout=timeout_sec)
     except asyncio.TimeoutError:
         proc.kill()
         return None
 
-    for root, dirs, files in os.walk(out_dir):
+    for root, _, files in os.walk(out_dir):
         for f in files:
             if f.lower().endswith(".mp3"):
                 return os.path.join(root, f)
-
     return None
 
 
-# -------------------------
-# yt-dlp fallback (99% mode) ✅
-# -------------------------
 async def download_with_ytdlp_queries(queries: list, out_dir: str, timeout_sec=420):
-    """
-    Try multiple yt-dlp search queries.
-    Returns mp3_path or None
-    """
     if not _ytdlp_ok():
         return None
 
     outtmpl = os.path.join(out_dir, "%(title).80s.%(ext)s")
 
-    # extra options to reduce youtube block
     extra = [
         "--geo-bypass",
         "--no-check-certificates",
@@ -230,8 +214,7 @@ async def download_with_ytdlp_queries(queries: list, out_dir: str, timeout_sec=4
             proc.kill()
             continue
 
-        # find mp3
-        for root, dirs, files in os.walk(out_dir):
+        for root, _, files in os.walk(out_dir):
             for f in files:
                 if f.lower().endswith(".mp3"):
                     return os.path.join(root, f)
@@ -239,27 +222,6 @@ async def download_with_ytdlp_queries(queries: list, out_dir: str, timeout_sec=4
     return None
 
 
-def build_best_queries(title: str, artists: str):
-    title = (title or "").strip()
-    artists = (artists or "").strip()
-
-    if not title:
-        return []
-
-    # ✅ Premium best queries
-    base = f"{title} {artists}".strip()
-    return [
-        f"{base} audio",
-        f"{base} official audio",
-        f"{base} lyrics",
-        f"{title} {artists} song",
-        f"{title} {artists} topic"
-    ]
-
-
-# -------------------------
-# AUTO START DOWNLOAD ✅
-# -------------------------
 async def spotify_auto_download(
     client,
     message,
@@ -275,7 +237,6 @@ async def spotify_auto_download(
     SPOTIFY_STATE[uid] = spotify_url
 
     status = await get_or_create_status(message, uid)
-
     await safe_edit(status, "🎧 **Spotify Link Detected**\n\n⏳ Processing started...")
     await asyncio.sleep(0.4)
 
@@ -283,11 +244,11 @@ async def spotify_auto_download(
         out_dir = os.path.join(DOWNLOAD_DIR, f"spotify_{uid}_{int(time.time())}")
         os.makedirs(out_dir, exist_ok=True)
 
+        kb_cancel = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_{uid}")]])
+
         thumb_path = None
         audio_path = None
         anim_task = None
-
-        kb_cancel = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_{uid}")]])
 
         try:
             USER_CANCEL.discard(uid)
@@ -295,52 +256,50 @@ async def spotify_auto_download(
             if not _ffmpeg_ok():
                 raise Exception("ffmpeg not installed. Run: apt-get install -y ffmpeg")
 
-            # ✅ 1) Extract metadata (title + artist + cover)
+            if not _spotdl_ok():
+                raise Exception("spotdl not installed. Run: pip install -U spotdl")
+
+            if not _ytdlp_ok():
+                raise Exception("yt-dlp not installed. Run: pip install -U yt-dlp")
+
+            # metadata
             await safe_edit(status, "🔎 Fetching Spotify metadata...\n\n⏳ Please wait...", kb_cancel)
             meta = await get_spotify_metadata(spotify_url)
-
             title = meta.get("title", "")
             artists = meta.get("artists", "")
             cover_url = meta.get("cover_url", "")
 
-            # ✅ 2) Album cover
-            anim_task = asyncio.create_task(animated_processing(status, "🖼 Fetching Album Cover...", 18, 0.25, kb_cancel))
+            # cover
+            anim_task = asyncio.create_task(animated_processing(status, "🖼 Fetching Album Cover...", 0.25, kb_cancel))
             thumb_path = await fetch_album_cover_from_url(cover_url, os.path.join(out_dir, "cover.jpg"))
-            if anim_task:
-                anim_task.cancel()
+            anim_task.cancel()
 
-            # ✅ 3) Try spotdl first
-            anim_task = asyncio.create_task(animated_processing(status, "⬇️ Downloading MP3 (spotdl)...", 45, 0.30, kb_cancel))
-            audio_path = await download_with_spotdl(spotify_url, out_dir, timeout_sec=420)
-            if anim_task:
-                anim_task.cancel()
+            # spotdl
+            anim_task = asyncio.create_task(animated_processing(status, "⬇️ Downloading MP3 (spotdl)...", 0.30, kb_cancel))
+            audio_path = await download_with_spotdl(spotify_url, out_dir, timeout_sec=300)  # ✅ 5 min
+            anim_task.cancel()
 
             if uid in USER_CANCEL:
                 raise asyncio.CancelledError
 
-            # ✅ 4) Fallback yt-dlp (99% mode)
+            # fallback
             if not audio_path:
-                await safe_edit(status, "⚠️ spotdl blocked/slow.\n\n🔁 Switching to yt-dlp (99% mode)...", kb_cancel)
+                await safe_edit(status, "⚠️ spotdl stuck/blocked.\n\n🔁 Switching to yt-dlp 99% mode...", kb_cancel)
                 await asyncio.sleep(1)
 
                 queries = build_best_queries(title, artists)
-
-                # if metadata missing, fallback to url search
                 if not queries:
                     queries = [spotify_url]
 
-                anim_task = asyncio.create_task(animated_processing(status, "⬇️ Downloading MP3 (yt-dlp fallback)...", 55, 0.28, kb_cancel))
-                audio_path = await download_with_ytdlp_queries(queries, out_dir, timeout_sec=420)
-                if anim_task:
-                    anim_task.cancel()
+                anim_task = asyncio.create_task(animated_processing(status, "⬇️ Downloading MP3 (yt-dlp fallback)...", 0.28, kb_cancel))
+                audio_path = await download_with_ytdlp_queries(queries, out_dir, timeout_sec=300)
+                anim_task.cancel()
 
             if not audio_path:
-                raise Exception("Both spotdl & yt-dlp failed.\nYouTube blocked or match not found.\nTry later.")
+                raise Exception("Song not downloaded.\nYouTube blocked or match not found.\nTry later.")
 
-            # ✅ upload
-            title_disp = nice_name(audio_path)
-
-            anim_task = asyncio.create_task(animated_processing(status, "📤 Uploading MP3...", 22, 0.28, kb_cancel))
+            # upload
+            anim_task = asyncio.create_task(animated_processing(status, "📤 Uploading MP3...", 0.28, kb_cancel))
 
             await client.send_audio(
                 chat_id=message.chat.id,
@@ -348,16 +307,14 @@ async def spotify_auto_download(
                 thumb=thumb_path if thumb_path and os.path.exists(thumb_path) else None,
                 caption=(
                     "✅ **Spotify Download Completed** 🎵\n\n"
-                    f"🎧 **{title_disp}**\n"
+                    f"🎧 **{nice_name(audio_path)}**\n"
                     f"👤 Artist: **{artists or 'Unknown'}**\n"
                     "📌 Format: **MP3**\n"
                     "🖼 Thumb: **Album Cover** ✅"
                 )
             )
 
-            if anim_task:
-                anim_task.cancel()
-
+            anim_task.cancel()
             await safe_edit(status, "✅ Done ✅", reply_markup=main_menu_keyboard())
 
         except asyncio.CancelledError:
