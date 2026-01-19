@@ -1,6 +1,7 @@
 import os
 import re
 import time
+import json
 import asyncio
 import shutil
 import subprocess
@@ -34,6 +35,10 @@ def _ffmpeg_ok():
     return _bin_exists("ffmpeg") and _bin_exists("ffprobe")
 
 
+def _ytdlp_ok():
+    return _bin_exists("yt-dlp")
+
+
 async def safe_edit(msg, text, reply_markup=None):
     try:
         await msg.edit(text, reply_markup=reply_markup)
@@ -52,72 +57,83 @@ def nice_name(path: str):
 # Animated Processing Bar ✅
 # -------------------------
 async def animated_processing(status, title, steps=40, delay=0.3, cancel_kb=None):
-    """
-    Fake animation: ⚪ -> 🟣 bar
-    """
     bar_len = 14
     for i in range(steps):
         filled = int((i / (steps - 1)) * bar_len)
         bar = "🟣" * filled + "⚪" * (bar_len - filled)
 
-        text = (
-            f"{title}\n\n"
-            f"[{bar}]\n\n"
-            f"⏳ Please wait..."
-        )
+        text = f"{title}\n\n[{bar}]\n\n⏳ Please wait..."
         await safe_edit(status, text, reply_markup=cancel_kb)
         await asyncio.sleep(delay)
 
 
 # -------------------------
-# Album Cover Fetch ✅
+# Spotify metadata extract ✅ (Title + Artists)
 # -------------------------
-async def fetch_album_cover(spotify_url: str, save_path: str):
+async def get_spotify_metadata(spotify_url: str):
     """
-    Uses spotdl metadata save -> gets cover url -> downloads it.
+    Uses: spotdl save <url> --save-file
+    Returns dict: {title, artists, cover_url}
     """
+    if not _spotdl_ok():
+        return {}
+
+    tmp_json = f"/tmp/sp_meta_{int(time.time())}.json"
+
     try:
-        if not _spotdl_ok():
-            return None
-
-        meta_json = save_path + ".json"
-
-        cmd = ["spotdl", "save", spotify_url, "--save-file", meta_json]
+        cmd = ["spotdl", "save", spotify_url, "--save-file", tmp_json]
         proc = await asyncio.create_subprocess_exec(
             *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
         )
         await proc.communicate()
 
-        if not os.path.exists(meta_json):
-            return None
+        if not os.path.exists(tmp_json):
+            return {}
 
-        import json
-        with open(meta_json, "r", encoding="utf-8", errors="ignore") as f:
+        with open(tmp_json, "r", encoding="utf-8", errors="ignore") as f:
             data = json.load(f)
 
-        cover_url = None
-        if isinstance(data, dict):
-            cover_url = (
-                data.get("cover_url")
-                or data.get("coverUrl")
-                or data.get("album_cover_url")
-                or data.get("albumCoverUrl")
-            )
+        if isinstance(data, list) and data:
+            data = data[0]
 
-        if not cover_url and isinstance(data, list) and data:
-            d0 = data[0]
-            cover_url = (
-                d0.get("cover_url")
-                or d0.get("coverUrl")
-                or d0.get("album_cover_url")
-                or d0.get("albumCoverUrl")
-            )
+        if not isinstance(data, dict):
+            return {}
 
+        title = data.get("name") or data.get("title") or ""
+        artists = data.get("artists") or data.get("artist") or ""
+        cover_url = (
+            data.get("cover_url")
+            or data.get("coverUrl")
+            or data.get("album_cover_url")
+            or data.get("albumCoverUrl")
+            or ""
+        )
+
+        # artists can be list
+        if isinstance(artists, list):
+            artists = ", ".join([str(x) for x in artists if x])
+
+        return {
+            "title": str(title).strip(),
+            "artists": str(artists).strip(),
+            "cover_url": str(cover_url).strip()
+        }
+
+    except:
+        return {}
+    finally:
         try:
-            os.remove(meta_json)
+            if os.path.exists(tmp_json):
+                os.remove(tmp_json)
         except:
             pass
 
+
+# -------------------------
+# Album Cover Fetch ✅
+# -------------------------
+async def fetch_album_cover_from_url(cover_url: str, save_path: str):
+    try:
         if not cover_url:
             return None
 
@@ -133,11 +149,112 @@ async def fetch_album_cover(spotify_url: str, save_path: str):
 
         if os.path.exists(save_path) and os.path.getsize(save_path) > 0:
             return save_path
-
     except:
         return None
 
     return None
+
+
+# -------------------------
+# spotdl download
+# -------------------------
+async def download_with_spotdl(spotify_url: str, out_dir: str, timeout_sec=420):
+    """
+    Returns mp3_path or None
+    """
+    if not _spotdl_ok():
+        return None
+
+    cmd = ["spotdl", spotify_url, "--output", out_dir, "--audio", "youtube-music"]
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE
+    )
+
+    try:
+        await asyncio.wait_for(proc.communicate(), timeout=timeout_sec)
+    except asyncio.TimeoutError:
+        proc.kill()
+        return None
+
+    for root, dirs, files in os.walk(out_dir):
+        for f in files:
+            if f.lower().endswith(".mp3"):
+                return os.path.join(root, f)
+
+    return None
+
+
+# -------------------------
+# yt-dlp fallback (99% mode) ✅
+# -------------------------
+async def download_with_ytdlp_queries(queries: list, out_dir: str, timeout_sec=420):
+    """
+    Try multiple yt-dlp search queries.
+    Returns mp3_path or None
+    """
+    if not _ytdlp_ok():
+        return None
+
+    outtmpl = os.path.join(out_dir, "%(title).80s.%(ext)s")
+
+    # extra options to reduce youtube block
+    extra = [
+        "--geo-bypass",
+        "--no-check-certificates",
+        "--extractor-args", "youtube:player_client=android"
+    ]
+
+    for q in queries:
+        cmd = [
+            "yt-dlp",
+            f"ytsearch1:{q}",
+            "-x",
+            "--audio-format", "mp3",
+            "--audio-quality", "0",
+            "-o", outtmpl,
+            "--no-playlist",
+            *extra
+        ]
+
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+
+        try:
+            await asyncio.wait_for(proc.communicate(), timeout=timeout_sec)
+        except asyncio.TimeoutError:
+            proc.kill()
+            continue
+
+        # find mp3
+        for root, dirs, files in os.walk(out_dir):
+            for f in files:
+                if f.lower().endswith(".mp3"):
+                    return os.path.join(root, f)
+
+    return None
+
+
+def build_best_queries(title: str, artists: str):
+    title = (title or "").strip()
+    artists = (artists or "").strip()
+
+    if not title:
+        return []
+
+    # ✅ Premium best queries
+    base = f"{title} {artists}".strip()
+    return [
+        f"{base} audio",
+        f"{base} official audio",
+        f"{base} lyrics",
+        f"{title} {artists} song",
+        f"{title} {artists} topic"
+    ]
 
 
 # -------------------------
@@ -159,12 +276,7 @@ async def spotify_auto_download(
 
     status = await get_or_create_status(message, uid)
 
-    # ✅ initial UI
-    await safe_edit(
-        status,
-        "🎧 **Spotify Link Detected**\n\n"
-        "⏳ Processing started..."
-    )
+    await safe_edit(status, "🎧 **Spotify Link Detected**\n\n⏳ Processing started...")
     await asyncio.sleep(0.4)
 
     async def job():
@@ -175,69 +287,60 @@ async def spotify_auto_download(
         audio_path = None
         anim_task = None
 
+        kb_cancel = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_{uid}")]])
+
         try:
             USER_CANCEL.discard(uid)
-
-            if not _spotdl_ok():
-                raise Exception("spotdl not installed. Run: pip install -U spotdl")
 
             if not _ffmpeg_ok():
                 raise Exception("ffmpeg not installed. Run: apt-get install -y ffmpeg")
 
-            kb_cancel = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_{uid}")]])
+            # ✅ 1) Extract metadata (title + artist + cover)
+            await safe_edit(status, "🔎 Fetching Spotify metadata...\n\n⏳ Please wait...", kb_cancel)
+            meta = await get_spotify_metadata(spotify_url)
 
-            # ✅ album cover animation
-            anim_task = asyncio.create_task(
-                animated_processing(status, "🖼 Fetching Album Cover...", steps=18, delay=0.25, cancel_kb=kb_cancel)
-            )
-            thumb_path = await fetch_album_cover(spotify_url, os.path.join(out_dir, "cover.jpg"))
+            title = meta.get("title", "")
+            artists = meta.get("artists", "")
+            cover_url = meta.get("cover_url", "")
+
+            # ✅ 2) Album cover
+            anim_task = asyncio.create_task(animated_processing(status, "🖼 Fetching Album Cover...", 18, 0.25, kb_cancel))
+            thumb_path = await fetch_album_cover_from_url(cover_url, os.path.join(out_dir, "cover.jpg"))
             if anim_task:
                 anim_task.cancel()
 
-            # ✅ downloading animation
-            anim_task = asyncio.create_task(
-                animated_processing(status, "⬇️ Downloading MP3...", steps=45, delay=0.30, cancel_kb=kb_cancel)
-            )
-
-            cmd = ["spotdl", spotify_url, "--output", out_dir]
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
-            )
-
-            # ✅ wait with timeout
-            try:
-                out, err = await asyncio.wait_for(proc.communicate(), timeout=420)  # 7 minutes
-            except asyncio.TimeoutError:
-                proc.kill()
-                raise Exception("Timeout! YouTube match blocked/slow.\nTry again later.")
-
+            # ✅ 3) Try spotdl first
+            anim_task = asyncio.create_task(animated_processing(status, "⬇️ Downloading MP3 (spotdl)...", 45, 0.30, kb_cancel))
+            audio_path = await download_with_spotdl(spotify_url, out_dir, timeout_sec=420)
             if anim_task:
                 anim_task.cancel()
 
-            # cancel support
             if uid in USER_CANCEL:
                 raise asyncio.CancelledError
 
-            # find mp3
-            for root, dirs, files in os.walk(out_dir):
-                for f in files:
-                    if f.lower().endswith(".mp3"):
-                        audio_path = os.path.join(root, f)
-                        break
-                if audio_path:
-                    break
+            # ✅ 4) Fallback yt-dlp (99% mode)
+            if not audio_path:
+                await safe_edit(status, "⚠️ spotdl blocked/slow.\n\n🔁 Switching to yt-dlp (99% mode)...", kb_cancel)
+                await asyncio.sleep(1)
+
+                queries = build_best_queries(title, artists)
+
+                # if metadata missing, fallback to url search
+                if not queries:
+                    queries = [spotify_url]
+
+                anim_task = asyncio.create_task(animated_processing(status, "⬇️ Downloading MP3 (yt-dlp fallback)...", 55, 0.28, kb_cancel))
+                audio_path = await download_with_ytdlp_queries(queries, out_dir, timeout_sec=420)
+                if anim_task:
+                    anim_task.cancel()
 
             if not audio_path:
-                raise Exception("Song not downloaded.\nTry another Spotify track.")
+                raise Exception("Both spotdl & yt-dlp failed.\nYouTube blocked or match not found.\nTry later.")
 
-            title = nice_name(audio_path)
+            # ✅ upload
+            title_disp = nice_name(audio_path)
 
-            # ✅ upload animation
-            anim_task = asyncio.create_task(
-                animated_processing(status, "📤 Uploading MP3...", steps=22, delay=0.28, cancel_kb=kb_cancel)
-            )
+            anim_task = asyncio.create_task(animated_processing(status, "📤 Uploading MP3...", 22, 0.28, kb_cancel))
 
             await client.send_audio(
                 chat_id=message.chat.id,
@@ -245,7 +348,8 @@ async def spotify_auto_download(
                 thumb=thumb_path if thumb_path and os.path.exists(thumb_path) else None,
                 caption=(
                     "✅ **Spotify Download Completed** 🎵\n\n"
-                    f"🎧 **{title}**\n"
+                    f"🎧 **{title_disp}**\n"
+                    f"👤 Artist: **{artists or 'Unknown'}**\n"
                     "📌 Format: **MP3**\n"
                     "🖼 Thumb: **Album Cover** ✅"
                 )
@@ -270,11 +374,7 @@ async def spotify_auto_download(
                     anim_task.cancel()
             except:
                 pass
-            await safe_edit(
-                status,
-                f"❌ **Spotify Download Failed**\n\nError:\n`{e}`",
-                reply_markup=main_menu_keyboard()
-            )
+            await safe_edit(status, f"❌ **Spotify Download Failed**\n\nError:\n`{e}`", reply_markup=main_menu_keyboard())
 
         finally:
             SPOTIFY_STATE.pop(uid, None)
