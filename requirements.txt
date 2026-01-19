@@ -5,3 +5,5 @@ humanize==4.10.0
 Flask==3.0.3
 gunicorn==22.0.0
 yt-dlp==2025.01.15
+
+spotdl
