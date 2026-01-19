@@ -86,7 +86,6 @@ def make_circle_bar(percent: float, slots: int = 14):
 
 
 def make_progress_text(title, done, total, speed, eta):
-    # ✅ Total unknown support
     if not total or total <= 0:
         bar = make_circle_bar(0)
         speed_str = naturalsize(int(speed)) + "/s" if speed else "0 B/s"
@@ -102,7 +101,6 @@ def make_progress_text(title, done, total, speed, eta):
     percent = (done / total * 100)
     bar = make_circle_bar(percent)
     speed_str = naturalsize(int(speed)) + "/s" if speed else "0 B/s"
-
     return (
         f"✨ **{title}**\n\n"
         f"{bar}\n\n"
@@ -162,7 +160,6 @@ async def upload_progress(current, total, status_msg, uid, start_time, USER_CANC
     if not hasattr(status_msg, "_last_edit"):
         status_msg._last_edit = 0
 
-    # 3 sec update
     if now - status_msg._last_edit > 3:
         status_msg._last_edit = now
         kb = InlineKeyboardMarkup(
@@ -225,11 +222,12 @@ async def download_stream(url, file_path, status_msg, uid, USER_CANCEL: set):
 
 
 # -------------------------
-# Video Fix (MP4 + Faststart)
+# FFMPEG helpers
 # -------------------------
 def _ffmpeg_exists():
     try:
         subprocess.run(["ffmpeg", "-version"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(["ffprobe", "-version"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         return True
     except:
         return False
@@ -238,27 +236,15 @@ def _ffmpeg_exists():
 def ensure_mp4_faststart(input_path: str):
     """
     ✅ Always output MP4
-    ✅ Add faststart metadata for Telegram seeking/resume
+    ✅ Add faststart metadata (seek/resume fix)
     """
     if not _ffmpeg_exists():
-        return input_path  # ffmpeg not available, fallback
+        return input_path
 
     out_path = input_path + "_fixed.mp4"
 
-    # Convert/remux to mp4 + faststart
-    cmd = [
-        "ffmpeg", "-y",
-        "-i", input_path,
-        "-c", "copy",
-        "-movflags", "+faststart",
-        out_path
-    ]
-
-    # If stream copy fails (ex: webm), fallback to re-encode mp4
-    try:
-        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    except:
-        pass
+    cmd = ["ffmpeg", "-y", "-i", input_path, "-c", "copy", "-movflags", "+faststart", out_path]
+    subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
         try:
@@ -267,29 +253,68 @@ def ensure_mp4_faststart(input_path: str):
             pass
         return out_path
 
-    # fallback: re-encode
-    out_path2 = input_path + "_encode.mp4"
+    # fallback re-encode
+    out2 = input_path + "_encode.mp4"
     cmd2 = [
         "ffmpeg", "-y",
         "-i", input_path,
         "-c:v", "libx264", "-preset", "veryfast",
         "-c:a", "aac", "-b:a", "128k",
         "-movflags", "+faststart",
-        out_path2
+        out2
     ]
-    try:
-        subprocess.run(cmd2, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    except:
-        pass
+    subprocess.run(cmd2, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-    if os.path.exists(out_path2) and os.path.getsize(out_path2) > 0:
+    if os.path.exists(out2) and os.path.getsize(out2) > 0:
         try:
             os.remove(input_path)
         except:
             pass
-        return out_path2
+        return out2
 
     return input_path
+
+
+def generate_middle_thumbnail(video_path: str):
+    """
+    ✅ Extract thumbnail from middle portion of video
+    """
+    if not _ffmpeg_exists():
+        return None
+
+    try:
+        thumb = video_path + "_thumb.jpg"
+
+        duration = 0
+        try:
+            p = subprocess.check_output([
+                "ffprobe", "-v", "error",
+                "-show_entries", "format=duration",
+                "-of", "default=noprint_wrappers=1:nokey=1",
+                video_path
+            ]).decode().strip()
+            duration = float(p) if p else 0
+        except:
+            duration = 0
+
+        middle = duration / 2 if duration > 2 else 1
+
+        cmd = [
+            "ffmpeg", "-y",
+            "-ss", str(middle),
+            "-i", video_path,
+            "-vframes", "1",
+            "-q:v", "4",
+            thumb
+        ]
+        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        if os.path.exists(thumb) and os.path.getsize(thumb) > 0:
+            return thumb
+    except:
+        pass
+
+    return None
 
 
 # ==========================
@@ -328,14 +353,18 @@ async def url_callback_router(
     url = URL_STATE[uid]
     mode = "video" if data == "url_send_video" else "file"
 
-    await cb.answer()
+    # ✅ instant popup response
+    await cb.answer("⏳ Processing...", show_alert=False)
 
-    # ✅ UI FIX: show processing instantly
+    # ✅ UI FIX: show processing instantly (NO MISS)
     status = await get_or_create_status(cb.message, uid)
     await safe_edit(status, "⏳ Processing started...\n\n⬇️ Preparing download...")
+    await asyncio.sleep(0.4)  # ✅ UI render guarantee
 
     async def job():
         file_path = None
+        thumb_path = None
+
         try:
             USER_CANCEL.discard(uid)
 
@@ -352,13 +381,20 @@ async def url_callback_router(
             if uid in USER_CANCEL:
                 raise asyncio.CancelledError
 
-            # ✅ If video -> mp4 + faststart fix for resume/seek
+            size = os.path.getsize(file_path)
+
+            # ✅ If video -> mp4 + faststart + thumbnail
             if mode == "video":
-                await safe_edit(status, "🎥 Preparing MP4...\n\n⏳ Please wait...")
+                await safe_edit(status, "🎥 Preparing MP4 + Streaming Fix...\n\n⏳ Please wait...")
                 file_path = ensure_mp4_faststart(file_path)
+
+                # update display name
                 name_clean = clean_display_name(os.path.basename(file_path))
 
-            size = os.path.getsize(file_path)
+                # middle thumbnail
+                await safe_edit(status, "🖼 Generating Thumbnail (Middle Frame)...\n\n⏳ Please wait...")
+                thumb_path = generate_middle_thumbnail(file_path)
+
             up_start = time.time()
 
             # ✅ Upload UI + progress bar
@@ -369,6 +405,7 @@ async def url_callback_router(
                     video=file_path,
                     caption=f"✅ Uploaded 🎥\n\n📌 `{name_clean}`\n📦 {naturalsize(size)}",
                     supports_streaming=True,
+                    thumb=thumb_path if thumb_path else None,
                     progress=upload_progress,
                     progress_args=(status, uid, up_start, USER_CANCEL),
                 )
@@ -389,10 +426,18 @@ async def url_callback_router(
         except Exception as e:
             await safe_edit(status, f"❌ URL Upload Failed!\n\nError: `{e}`", reply_markup=main_menu_keyboard())
         finally:
-            # cleanup
+            # cleanup states
             URL_STATE.pop(uid, None)
             USER_CANCEL.discard(uid)
 
+            # delete thumb
+            try:
+                if thumb_path and os.path.exists(thumb_path):
+                    os.remove(thumb_path)
+            except:
+                pass
+
+            # delete downloaded file
             try:
                 if file_path and os.path.exists(file_path):
                     os.remove(file_path)
