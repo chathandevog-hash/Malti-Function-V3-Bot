@@ -9,15 +9,11 @@ from urllib.parse import urlparse, unquote
 
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
-# -------------------------
-# Settings
-# -------------------------
 DOWNLOAD_DIR = os.getenv("DOWNLOAD_DIR", "downloads")
 URL_UPLOAD_LIMIT = 2 * 1024 * 1024 * 1024  # ✅ 2GB
 CHUNK_SIZE = 1024 * 256
 
-# uid -> url
-URL_STATE = {}
+URL_STATE = {}  # uid -> url session
 
 
 # -------------------------
@@ -126,10 +122,12 @@ async def get_filename_and_size(url: str):
         async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.get(url, allow_redirects=True) as r:
                 if r.headers.get("Content-Length"):
-                    total = int(r.headers.get("Content-Length"))
+                    total = int(r.headers.get("Content-Length") or 0)
+
                 cd = r.headers.get("Content-Disposition", "")
                 if "filename=" in cd:
                     filename = cd.split("filename=")[-1].strip().strip('"').strip("'")
+
                 if not filename:
                     p = urlparse(str(r.url))
                     base = os.path.basename(p.path)
@@ -146,7 +144,89 @@ async def get_filename_and_size(url: str):
 
 
 # -------------------------
-# Progress Handlers
+# FFMPEG
+# -------------------------
+def _ffmpeg_exists():
+    try:
+        subprocess.run(["ffmpeg", "-version"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(["ffprobe", "-version"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return True
+    except:
+        return False
+
+
+def ensure_mp4_faststart(input_path: str):
+    if not _ffmpeg_exists():
+        return input_path
+
+    out_path = input_path + "_fixed.mp4"
+
+    cmd = ["ffmpeg", "-y", "-i", input_path, "-c", "copy", "-movflags", "+faststart", out_path]
+    subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
+        try:
+            os.remove(input_path)
+        except:
+            pass
+        return out_path
+
+    # fallback encode
+    out2 = input_path + "_encode.mp4"
+    cmd2 = [
+        "ffmpeg", "-y",
+        "-i", input_path,
+        "-c:v", "libx264", "-preset", "veryfast",
+        "-c:a", "aac", "-b:a", "128k",
+        "-movflags", "+faststart",
+        out2
+    ]
+    subprocess.run(cmd2, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    if os.path.exists(out2) and os.path.getsize(out2) > 0:
+        try:
+            os.remove(input_path)
+        except:
+            pass
+        return out2
+
+    return input_path
+
+
+def generate_middle_thumbnail(video_path: str):
+    if not _ffmpeg_exists():
+        return None
+
+    try:
+        thumb = video_path + "_thumb.jpg"
+
+        duration = 0.0
+        try:
+            p = subprocess.check_output([
+                "ffprobe", "-v", "error",
+                "-show_entries", "format=duration",
+                "-of", "default=noprint_wrappers=1:nokey=1",
+                video_path
+            ]).decode().strip()
+            duration = float(p) if p else 0.0
+        except:
+            duration = 0.0
+
+        middle = duration / 2 if duration > 2 else 1
+
+        cmd = ["ffmpeg", "-y", "-ss", str(middle), "-i", video_path, "-vframes", "1", "-q:v", "4", thumb]
+        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        if os.path.exists(thumb) and os.path.getsize(thumb) > 0:
+            return thumb
+    except:
+        pass
+
+    return None
+
+
+# -------------------------
+# Progress
 # -------------------------
 async def upload_progress(current, total, status_msg, uid, start_time, USER_CANCEL: set):
     if uid in USER_CANCEL:
@@ -222,104 +302,8 @@ async def download_stream(url, file_path, status_msg, uid, USER_CANCEL: set):
 
 
 # -------------------------
-# FFMPEG helpers
+# Public API
 # -------------------------
-def _ffmpeg_exists():
-    try:
-        subprocess.run(["ffmpeg", "-version"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        subprocess.run(["ffprobe", "-version"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        return True
-    except:
-        return False
-
-
-def ensure_mp4_faststart(input_path: str):
-    """
-    ✅ Always output MP4
-    ✅ Add faststart metadata (seek/resume fix)
-    """
-    if not _ffmpeg_exists():
-        return input_path
-
-    out_path = input_path + "_fixed.mp4"
-
-    cmd = ["ffmpeg", "-y", "-i", input_path, "-c", "copy", "-movflags", "+faststart", out_path]
-    subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
-    if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
-        try:
-            os.remove(input_path)
-        except:
-            pass
-        return out_path
-
-    # fallback re-encode
-    out2 = input_path + "_encode.mp4"
-    cmd2 = [
-        "ffmpeg", "-y",
-        "-i", input_path,
-        "-c:v", "libx264", "-preset", "veryfast",
-        "-c:a", "aac", "-b:a", "128k",
-        "-movflags", "+faststart",
-        out2
-    ]
-    subprocess.run(cmd2, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
-    if os.path.exists(out2) and os.path.getsize(out2) > 0:
-        try:
-            os.remove(input_path)
-        except:
-            pass
-        return out2
-
-    return input_path
-
-
-def generate_middle_thumbnail(video_path: str):
-    """
-    ✅ Extract thumbnail from middle portion of video
-    """
-    if not _ffmpeg_exists():
-        return None
-
-    try:
-        thumb = video_path + "_thumb.jpg"
-
-        duration = 0
-        try:
-            p = subprocess.check_output([
-                "ffprobe", "-v", "error",
-                "-show_entries", "format=duration",
-                "-of", "default=noprint_wrappers=1:nokey=1",
-                video_path
-            ]).decode().strip()
-            duration = float(p) if p else 0
-        except:
-            duration = 0
-
-        middle = duration / 2 if duration > 2 else 1
-
-        cmd = [
-            "ffmpeg", "-y",
-            "-ss", str(middle),
-            "-i", video_path,
-            "-vframes", "1",
-            "-q:v", "4",
-            thumb
-        ]
-        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
-        if os.path.exists(thumb) and os.path.getsize(thumb) > 0:
-            return thumb
-    except:
-        pass
-
-    return None
-
-
-# ==========================
-# PUBLIC API FOR bot.py
-# ==========================
 async def url_flow(client, message, url: str):
     uid = message.from_user.id
     URL_STATE[uid] = url
@@ -353,13 +337,11 @@ async def url_callback_router(
     url = URL_STATE[uid]
     mode = "video" if data == "url_send_video" else "file"
 
-    # ✅ instant popup response
+    # ✅ IMPORTANT: Processing UI GUARANTEED
     await cb.answer("⏳ Processing...", show_alert=False)
-
-    # ✅ UI FIX: show processing instantly (NO MISS)
     status = await get_or_create_status(cb.message, uid)
     await safe_edit(status, "⏳ Processing started...\n\n⬇️ Preparing download...")
-    await asyncio.sleep(0.4)  # ✅ UI render guarantee
+    await asyncio.sleep(0.5)
 
     async def job():
         file_path = None
@@ -371,11 +353,9 @@ async def url_callback_router(
             fname, _ = await get_filename_and_size(url)
             name_clean = clean_display_name(fname)
 
-            file_path = os.path.join(
-                DOWNLOAD_DIR, f"url_{uid}_{int(time.time())}_{fname}"
-            )
+            file_path = os.path.join(DOWNLOAD_DIR, f"url_{uid}_{int(time.time())}_{fname}")
 
-            # ✅ Download UI with progress
+            # 1) download
             await download_stream(url, file_path, status, uid, USER_CANCEL)
 
             if uid in USER_CANCEL:
@@ -383,29 +363,26 @@ async def url_callback_router(
 
             size = os.path.getsize(file_path)
 
-            # ✅ If video -> mp4 + faststart + thumbnail
+            # 2) mp4 + faststart + thumbnail
             if mode == "video":
-                await safe_edit(status, "🎥 Preparing MP4 + Streaming Fix...\n\n⏳ Please wait...")
+                await safe_edit(status, "🎥 Converting to MP4 + Streaming Fix...\n\n⏳ Please wait...")
                 file_path = ensure_mp4_faststart(file_path)
-
-                # update display name
                 name_clean = clean_display_name(os.path.basename(file_path))
 
-                # middle thumbnail
                 await safe_edit(status, "🖼 Generating Thumbnail (Middle Frame)...\n\n⏳ Please wait...")
                 thumb_path = generate_middle_thumbnail(file_path)
 
+            # 3) upload
             up_start = time.time()
 
-            # ✅ Upload UI + progress bar
             if mode == "video":
                 await safe_edit(status, "📤 Upload Starting (Video MP4)...")
                 await client.send_video(
                     chat_id=cb.message.chat.id,
                     video=file_path,
+                    thumb=thumb_path if thumb_path else None,
                     caption=f"✅ Uploaded 🎥\n\n📌 `{name_clean}`\n📦 {naturalsize(size)}",
                     supports_streaming=True,
-                    thumb=thumb_path if thumb_path else None,
                     progress=upload_progress,
                     progress_args=(status, uid, up_start, USER_CANCEL),
                 )
@@ -423,21 +400,20 @@ async def url_callback_router(
 
         except asyncio.CancelledError:
             await safe_edit(status, "❌ Cancelled ✅", reply_markup=main_menu_keyboard())
+
         except Exception as e:
             await safe_edit(status, f"❌ URL Upload Failed!\n\nError: `{e}`", reply_markup=main_menu_keyboard())
+
         finally:
-            # cleanup states
             URL_STATE.pop(uid, None)
             USER_CANCEL.discard(uid)
 
-            # delete thumb
             try:
                 if thumb_path and os.path.exists(thumb_path):
                     os.remove(thumb_path)
             except:
                 pass
 
-            # delete downloaded file
             try:
                 if file_path and os.path.exists(file_path):
                     os.remove(file_path)
