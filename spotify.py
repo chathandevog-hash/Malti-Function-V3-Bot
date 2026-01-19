@@ -49,11 +49,32 @@ def nice_name(path: str):
 
 
 # -------------------------
+# Animated Processing Bar ✅
+# -------------------------
+async def animated_processing(status, title, steps=40, delay=0.3, cancel_kb=None):
+    """
+    Fake animation: ⚪ -> 🟣 bar
+    """
+    bar_len = 14
+    for i in range(steps):
+        filled = int((i / (steps - 1)) * bar_len)
+        bar = "🟣" * filled + "⚪" * (bar_len - filled)
+
+        text = (
+            f"{title}\n\n"
+            f"[{bar}]\n\n"
+            f"⏳ Please wait..."
+        )
+        await safe_edit(status, text, reply_markup=cancel_kb)
+        await asyncio.sleep(delay)
+
+
+# -------------------------
 # Album Cover Fetch ✅
 # -------------------------
 async def fetch_album_cover(spotify_url: str, save_path: str):
     """
-    Uses spotdl save metadata -> gets cover url -> downloads it.
+    Uses spotdl metadata save -> gets cover url -> downloads it.
     """
     try:
         if not _spotdl_ok():
@@ -138,14 +159,13 @@ async def spotify_auto_download(
 
     status = await get_or_create_status(message, uid)
 
-    # ✅ instant UI
+    # ✅ initial UI
     await safe_edit(
         status,
         "🎧 **Spotify Link Detected**\n\n"
-        "⏳ Processing started...\n"
-        "🔍 Checking tools..."
+        "⏳ Processing started..."
     )
-    await asyncio.sleep(0.5)
+    await asyncio.sleep(0.4)
 
     async def job():
         out_dir = os.path.join(DOWNLOAD_DIR, f"spotify_{uid}_{int(time.time())}")
@@ -153,6 +173,7 @@ async def spotify_auto_download(
 
         thumb_path = None
         audio_path = None
+        anim_task = None
 
         try:
             USER_CANCEL.discard(uid)
@@ -165,12 +186,18 @@ async def spotify_auto_download(
 
             kb_cancel = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_{uid}")]])
 
-            # ✅ fetch album cover
-            await safe_edit(status, "🖼 Fetching album cover...\n\n⏳ Please wait...", kb_cancel)
+            # ✅ album cover animation
+            anim_task = asyncio.create_task(
+                animated_processing(status, "🖼 Fetching Album Cover...", steps=18, delay=0.25, cancel_kb=kb_cancel)
+            )
             thumb_path = await fetch_album_cover(spotify_url, os.path.join(out_dir, "cover.jpg"))
+            if anim_task:
+                anim_task.cancel()
 
-            # ✅ spotdl download
-            await safe_edit(status, "⬇️ Downloading MP3...\n\n⏳ Please wait...", kb_cancel)
+            # ✅ downloading animation
+            anim_task = asyncio.create_task(
+                animated_processing(status, "⬇️ Downloading MP3...", steps=45, delay=0.30, cancel_kb=kb_cancel)
+            )
 
             cmd = ["spotdl", spotify_url, "--output", out_dir]
             proc = await asyncio.create_subprocess_exec(
@@ -179,16 +206,19 @@ async def spotify_auto_download(
                 stderr=asyncio.subprocess.PIPE
             )
 
-            # cancel support
-            while True:
-                if uid in USER_CANCEL:
-                    proc.kill()
-                    raise asyncio.CancelledError
-                if proc.returncode is not None:
-                    break
-                await asyncio.sleep(0.5)
+            # ✅ wait with timeout
+            try:
+                out, err = await asyncio.wait_for(proc.communicate(), timeout=420)  # 7 minutes
+            except asyncio.TimeoutError:
+                proc.kill()
+                raise Exception("Timeout! YouTube match blocked/slow.\nTry again later.")
 
-            await proc.communicate()
+            if anim_task:
+                anim_task.cancel()
+
+            # cancel support
+            if uid in USER_CANCEL:
+                raise asyncio.CancelledError
 
             # find mp3
             for root, dirs, files in os.walk(out_dir):
@@ -200,12 +230,14 @@ async def spotify_auto_download(
                     break
 
             if not audio_path:
-                raise Exception("Song not downloaded. Try again later / another track.")
+                raise Exception("Song not downloaded.\nTry another Spotify track.")
 
             title = nice_name(audio_path)
 
-            # upload
-            await safe_edit(status, "📤 Uploading to Telegram...\n\n⏳ Please wait...", kb_cancel)
+            # ✅ upload animation
+            anim_task = asyncio.create_task(
+                animated_processing(status, "📤 Uploading MP3...", steps=22, delay=0.28, cancel_kb=kb_cancel)
+            )
 
             await client.send_audio(
                 chat_id=message.chat.id,
@@ -219,12 +251,25 @@ async def spotify_auto_download(
                 )
             )
 
+            if anim_task:
+                anim_task.cancel()
+
             await safe_edit(status, "✅ Done ✅", reply_markup=main_menu_keyboard())
 
         except asyncio.CancelledError:
+            try:
+                if anim_task:
+                    anim_task.cancel()
+            except:
+                pass
             await safe_edit(status, "❌ Cancelled ✅", reply_markup=main_menu_keyboard())
 
         except Exception as e:
+            try:
+                if anim_task:
+                    anim_task.cancel()
+            except:
+                pass
             await safe_edit(
                 status,
                 f"❌ **Spotify Download Failed**\n\nError:\n`{e}`",
