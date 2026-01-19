@@ -106,45 +106,58 @@ def make_thumb(video_path: str):
 
 
 # ===============================
-# Fancy bar
+# ✅ SQUARES % BAR
 # ===============================
-def fancy_bar(step: int):
-    bars = [
-        "⚪⚪⚪⚪⚪⚪⚪⚪⚪⚪⚪⚪⚪⚪",
-        "🔴🔴⚪⚪⚪⚪⚪⚪⚪⚪⚪⚪⚪⚪",
-        "🟠🟠🟠🟠⚪⚪⚪⚪⚪⚪⚪⚪⚪⚪",
-        "🟡🟡🟡🟡🟡🟡⚪⚪⚪⚪⚪⚪⚪⚪",
-        "🟢🟢🟢🟢🟢🟢🟢🟢⚪⚪⚪⚪⚪⚪",
-        "✅✅✅✅✅✅✅✅✅✅✅✅✅✅",
-    ]
-    return bars[step % len(bars)]
+def square_bar(percent: float) -> str:
+    total = 12
+    filled = int((percent / 100.0) * total)
+
+    # color transition
+    if percent < 5:
+        fill = "⚪"
+    elif percent < 25:
+        fill = "🟥"
+    elif percent < 50:
+        fill = "🟧"
+    elif percent < 80:
+        fill = "🟨"
+    else:
+        fill = "🟩"
+
+    bar = (fill * filled) + ("⬜" * (total - filled))
+    return f"{bar}  {percent:.1f}%"
 
 
 # ===============================
-# Progress Animator (FLOODSAFE) ✅
+# Progress Controller ✅
+# - download: real % from yt-dlp output
+# - upload : animated squares
 # ===============================
-async def progress_animator(uid: int, status_msg, label: str):
+async def upload_anim(uid: int, status_msg, label: str):
     kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_{uid}")]])
     step = 0
     last_edit = 0
 
+    frames = ["⚪", "🟥", "🟧", "🟨", "🟩", "✅"]
     while True:
         if uid in USER_CANCEL:
             return
 
         now = time.time()
-        if now - last_edit >= 11:  # ✅ safe
+        if now - last_edit >= 11:
             last_edit = now
             step += 1
+            fill = frames[step % len(frames)]
+            bar = (fill * (step % 12)) + ("⬜" * (12 - (step % 12)))
+
             await safe_edit(
                 status_msg,
                 f"📥 Instagram Reel Detected ✅\n\n"
-                f"⚙️ {label}\n\n"
-                f"{fancy_bar(step)}\n\n"
+                f"⬆️ {label}\n\n"
+                f"{bar}\n\n"
                 f"⏳ Please wait...",
                 reply_markup=kb
             )
-
         await asyncio.sleep(1.0)
 
 
@@ -157,9 +170,9 @@ def has_aria2c():
 
 
 # ===============================
-# yt-dlp download (FAST MODE ✅)
+# yt-dlp download (FASTER + % output) ✅
 # ===============================
-async def insta_download(url: str, uid: int):
+async def insta_download(url: str, uid: int, status_msg):
     os.makedirs(DOWNLOAD_DIR, exist_ok=True)
     url = clean_insta_url(url)
 
@@ -169,17 +182,18 @@ async def insta_download(url: str, uid: int):
         "yt-dlp",
         "--no-playlist",
         "--no-warnings",
-        "--socket-timeout", "15",
+        "--newline",  # ✅ important for real-time %
+        "--socket-timeout", "20",
         "--retries", "3",
 
-        # ✅ FAST: avoid heavy merge when possible
+        # ✅ best mp4 first (fast send)
         "-f", "best[ext=mp4]/best",
 
         "-o", outtmpl,
         url
     ]
 
-    # ✅ aria2c speed boost if available
+    # ✅ aria2c = speed boost (if available in docker)
     if has_aria2c():
         cmd.insert(1, "--downloader")
         cmd.insert(2, "aria2c")
@@ -191,6 +205,11 @@ async def insta_download(url: str, uid: int):
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.STDOUT
     )
+
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_{uid}")]])
+
+    last_edit = 0
+    last_percent = -1.0
 
     while True:
         if uid in USER_CANCEL:
@@ -204,19 +223,40 @@ async def insta_download(url: str, uid: int):
         if not line:
             break
 
+        try:
+            s = line.decode("utf-8", errors="ignore").strip()
+        except:
+            s = ""
+
+        # ✅ parse percent
+        m = re.search(r"\[download\]\s+(\d+(?:\.\d+)?)%", s)
+        if m:
+            percent = float(m.group(1))
+            now = time.time()
+            # ✅ edit only if changed enough + flood safe interval
+            if (percent - last_percent >= 2.0) and (now - last_edit >= 11):
+                last_percent = percent
+                last_edit = now
+                await safe_edit(
+                    status_msg,
+                    f"📥 Instagram Reel Detected ✅\n\n"
+                    f"⬇️ Downloading Reel...\n\n"
+                    f"{square_bar(percent)}\n\n"
+                    f"⏳ Please wait...",
+                    reply_markup=kb
+                )
+
     await proc.wait()
 
     if proc.returncode != 0:
         raise Exception("Insta download failed")
 
-    # ✅ find produced mp4
     base = outtmpl.replace("%(ext)s", "")
     for ext in ["mp4", "mkv", "webm"]:
         p = base + ext
         if os.path.exists(p):
             return p
 
-    # fallback scan
     files = [f for f in os.listdir(DOWNLOAD_DIR) if f.startswith(f"insta_{uid}_")]
     if not files:
         raise Exception("Downloaded file not found")
@@ -241,13 +281,14 @@ async def insta_entry(client, message, url: str, USER_TASKS, main_menu_keyboard)
         try:
             USER_CANCEL.discard(uid)
 
-            anim_task = asyncio.create_task(progress_animator(uid, status, "Downloading reel..."))
-            file_path = await insta_download(url, uid)
+            # ✅ Download with real percent squares
+            file_path = await insta_download(url, uid, status)
 
-            if anim_task and not anim_task.done():
-                anim_task.cancel()
+            if uid in USER_CANCEL:
+                raise asyncio.CancelledError
 
-            anim_task = asyncio.create_task(progress_animator(uid, status, "Uploading reel..."))
+            # ✅ Upload stage (simple squares animation)
+            anim_task = asyncio.create_task(upload_anim(uid, status, "Uploading Reel..."))
 
             thumb_path = make_thumb(file_path)
             info = ffprobe_info(file_path)
@@ -269,8 +310,11 @@ async def insta_entry(client, message, url: str, USER_TASKS, main_menu_keyboard)
                 **args
             )
 
-            if anim_task and not anim_task.done():
-                anim_task.cancel()
+            try:
+                if anim_task and not anim_task.done():
+                    anim_task.cancel()
+            except:
+                pass
 
             await safe_edit(status, "✅ Done ✅", reply_markup=main_menu_keyboard())
 
