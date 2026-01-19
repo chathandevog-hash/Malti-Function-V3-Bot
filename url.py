@@ -4,6 +4,7 @@ import time
 import asyncio
 import aiohttp
 import humanize
+import subprocess
 from urllib.parse import urlparse, unquote
 
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
@@ -152,7 +153,7 @@ async def upload_progress(current, total, status_msg, uid, start_time, USER_CANC
     if not hasattr(status_msg, "_last_edit"):
         status_msg._last_edit = 0
 
-    if now - status_msg._last_edit > 3:
+    if now - status_msg._last_edit > 6:
         status_msg._last_edit = now
         kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel Upload", callback_data=f"cancel_{uid}")]])
         await safe_edit(status_msg, make_progress_text("📤 Uploading...", current, total, speed, eta), kb)
@@ -197,10 +198,55 @@ async def download_stream(url, file_path, status_msg, uid, USER_CANCEL: set):
                     speed = downloaded / elapsed if elapsed > 0 else 0
                     eta = (total - downloaded) / speed if total and speed > 0 else 0
 
-                    if time.time() - last_edit > 3:
+                    if time.time() - last_edit > 6:
                         last_edit = time.time()
                         kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel Download", callback_data=f"cancel_{uid}")]])
                         await safe_edit(status_msg, make_progress_text("⬇️ Downloading...", downloaded, total, speed, eta), kb)
+
+    return downloaded, total
+
+
+# ✅ FFprobe duration
+def get_video_duration_seconds(path: str) -> float:
+    try:
+        cmd = [
+            "ffprobe", "-v", "error",
+            "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+            path
+        ]
+        out = subprocess.check_output(cmd, stderr=subprocess.DEVNULL).decode().strip()
+        return float(out)
+    except:
+        return 0.0
+
+
+# ✅ Thumbnail from middle
+def make_middle_thumbnail(video_path: str, out_thumb: str):
+    dur = get_video_duration_seconds(video_path)
+    seek = int(dur / 2) if dur > 2 else 1
+
+    cmd = [
+        "ffmpeg", "-y",
+        "-ss", str(seek),
+        "-i", video_path,
+        "-frames:v", "1",
+        "-q:v", "2",
+        out_thumb
+    ]
+    subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+# ✅ Fix streaming: faststart
+def optimize_streaming_mp4(input_path: str, out_path: str):
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", input_path,
+        "-c", "copy",
+        "-movflags", "+faststart",
+        out_path
+    ]
+    subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
 # ==========================
@@ -211,10 +257,8 @@ async def url_flow(client, message, url: str):
     URL_STATE[uid] = url
 
     kb = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("🎥 Video Upload", callback_data="url_send_video"),
-            InlineKeyboardButton("📁 File Upload", callback_data="url_send_file")
-        ],
+        [InlineKeyboardButton("🎥 Video Upload", callback_data="url_send_video"),
+         InlineKeyboardButton("📁 File Upload", callback_data="url_send_file")],
         [InlineKeyboardButton("⬅️ Back", callback_data="back_main")]
     ])
     await message.reply("✅ URL Detected 🌐\n\n👇 Choose upload type:", reply_markup=kb)
@@ -232,11 +276,15 @@ async def url_callback_router(client, cb, USER_TASKS, USER_CANCEL, get_or_create
 
     await cb.answer()
 
-    # ✅ FIX: create a real status message (NOT get_or_create_status bug)
-    status = await cb.message.reply("⏳ Processing started...\n\n⬇️ Preparing download...")
+    # ✅ Processing show immediately after click
+    status = await get_or_create_status(cb.message, uid)
+    await safe_edit(status, "⏳ Processing started...\n\n⬇️ Preparing download...")
 
     async def job():
         file_path = None
+        fixed_path = None
+        thumb_path = None
+
         try:
             USER_CANCEL.discard(uid)
 
@@ -253,18 +301,33 @@ async def url_callback_router(client, cb, USER_TASKS, USER_CANCEL, get_or_create
             size = os.path.getsize(file_path)
             up_start = time.time()
 
-            await safe_edit(status, "📤 Upload Starting...")
-
+            # ✅ video: streaming fix + middle thumbnail
+            upload_path = file_path
             if mode == "video":
+                await safe_edit(status, "⚡ Fixing Streaming (FastStart)...")
+                fixed_path = file_path.rsplit(".", 1)[0] + "_fast.mp4"
+                optimize_streaming_mp4(file_path, fixed_path)
+                if os.path.exists(fixed_path) and os.path.getsize(fixed_path) > 0:
+                    upload_path = fixed_path
+
+                await safe_edit(status, "🖼 Thumbnail (Middle Frame)...")
+                thumb_path = file_path.rsplit(".", 1)[0] + "_thumb.jpg"
+                make_middle_thumbnail(upload_path, thumb_path)
+
+            # ✅ Upload with progress bar
+            if mode == "video":
+                await safe_edit(status, "📤 Upload Starting...")
                 await client.send_video(
                     chat_id=cb.message.chat.id,
-                    video=file_path,
+                    video=upload_path,
                     caption=f"✅ Uploaded 🎥\n\n📌 `{name_clean}`\n📦 {naturalsize(size)}",
                     supports_streaming=True,
+                    thumb=thumb_path if thumb_path and os.path.exists(thumb_path) else None,
                     progress=upload_progress,
                     progress_args=(status, uid, up_start, USER_CANCEL),
                 )
             else:
+                await safe_edit(status, "📤 Upload Starting...")
                 await client.send_document(
                     chat_id=cb.message.chat.id,
                     document=file_path,
@@ -283,10 +346,11 @@ async def url_callback_router(client, cb, USER_TASKS, USER_CANCEL, get_or_create
             URL_STATE.pop(uid, None)
             USER_CANCEL.discard(uid)
 
-            try:
-                if file_path and os.path.exists(file_path):
-                    os.remove(file_path)
-            except:
-                pass
+            for p in [file_path, fixed_path, thumb_path]:
+                try:
+                    if p and os.path.exists(p):
+                        os.remove(p)
+                except:
+                    pass
 
     USER_TASKS[uid] = asyncio.create_task(job())
