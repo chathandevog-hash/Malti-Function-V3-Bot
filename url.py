@@ -18,10 +18,6 @@ CHUNK_SIZE = 1024 * 256
 URL_STATE = {}  # uid -> url
 
 
-def is_url(text: str):
-    return (text or "").startswith("http://") or (text or "").startswith("https://")
-
-
 def naturalsize(num_bytes: int):
     if num_bytes is None:
         return "Unknown"
@@ -81,17 +77,24 @@ def make_circle_bar(percent: float, slots: int = 14):
 
 
 def make_progress_text(title, done, total, speed, eta):
-    percent = (done / total * 100) if total else 0
-    bar = make_circle_bar(percent)
+    if total and total > 0:
+        percent = (done / total * 100)
+    else:
+        percent = 0
+
+    bar = make_circle_bar(percent if total else 10)  # unknown size -> show some movement
     speed_str = naturalsize(int(speed)) + "/s" if speed else "0 B/s"
+
+    total_text = naturalsize(total) if total else "Unknown"
+    eta_text = format_time(eta) if total else "Unknown"
 
     return (
         f"✨ **{title}**\n\n"
         f"{bar}\n\n"
         f"📊 Progress: **{percent:.2f}%**\n"
-        f"📦 Size: **{naturalsize(done)} / {naturalsize(total) if total else 'Unknown'}**\n"
+        f"📦 Size: **{naturalsize(done)} / {total_text}**\n"
         f"⚡ Speed: **{speed_str}**\n"
-        f"⏳ ETA: **{format_time(eta)}**"
+        f"⏳ ETA: **{eta_text}**"
     )
 
 
@@ -106,10 +109,15 @@ async def get_filename_and_size(url: str):
     filename = None
     total = 0
 
-    # Quick HEAD try
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome Mobile Safari/537.36",
+        "Accept": "*/*",
+    }
+
+    # HEAD try
     try:
         timeout = aiohttp.ClientTimeout(total=15)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
             async with session.head(url, allow_redirects=True) as r:
                 if r.headers.get("Content-Length"):
                     total = int(r.headers.get("Content-Length"))
@@ -124,11 +132,11 @@ async def get_filename_and_size(url: str):
     except:
         pass
 
-    # fallback GET small
+    # fallback GET
     if not filename:
         try:
             timeout = aiohttp.ClientTimeout(total=20)
-            async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
                 async with session.get(url, allow_redirects=True) as r:
                     if r.headers.get("Content-Length"):
                         total = int(r.headers.get("Content-Length"))
@@ -145,7 +153,6 @@ async def get_filename_and_size(url: str):
     return safe_filename(filename), total
 
 
-# ✅ upload progress bar (telegram)
 async def upload_progress(current, total, status_msg, uid, start_time, USER_CANCEL: set):
     if uid in USER_CANCEL:
         raise asyncio.CancelledError
@@ -158,8 +165,7 @@ async def upload_progress(current, total, status_msg, uid, start_time, USER_CANC
     if not hasattr(status_msg, "_last_edit"):
         status_msg._last_edit = 0
 
-    # avoid floodwait
-    if now - status_msg._last_edit > 5:
+    if now - status_msg._last_edit > 6:
         status_msg._last_edit = now
         kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel Upload", callback_data=f"cancel_{uid}")]])
         await safe_edit(status_msg, make_progress_text("📤 Uploading...", current, total, speed, eta), kb)
@@ -172,54 +178,70 @@ async def download_stream(url, file_path, status_msg, uid, USER_CANCEL: set):
     last_edit = 0
     total = 0
 
-    # ✅ Important: connect + sock_read timeout
-    timeout = aiohttp.ClientTimeout(connect=20, sock_read=60, total=None)
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome Mobile Safari/537.36",
+        "Accept": "*/*",
+        "Connection": "keep-alive",
+    }
 
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        async with session.get(url, allow_redirects=True) as r:
-            if r.status != 200:
-                raise Exception(f"HTTP {r.status}")
+    # retry 2 times
+    for attempt in range(1, 4):
+        try:
+            timeout = aiohttp.ClientTimeout(connect=25, sock_read=90, total=None)
+            async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+                async with session.get(url, allow_redirects=True) as r:
+                    if r.status != 200:
+                        raise Exception(f"HTTP {r.status}")
 
-            if r.headers.get("Content-Length"):
-                total = int(r.headers.get("Content-Length"))
+                    if r.headers.get("Content-Length"):
+                        total = int(r.headers.get("Content-Length"))
 
-            if total and total > URL_UPLOAD_LIMIT:
-                raise Exception("❌ URL file too large (max 2GB)")
+                    if total and total > URL_UPLOAD_LIMIT:
+                        raise Exception("❌ URL file too large (max 2GB)")
 
-            os.makedirs(os.path.dirname(file_path), exist_ok=True)
+                    os.makedirs(os.path.dirname(file_path), exist_ok=True)
 
-            kb0 = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel Download", callback_data=f"cancel_{uid}")]])
-            await safe_edit(status_msg, make_progress_text("⬇️ Downloading...", 0, total, 0, 0), kb0)
+                    kb0 = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel Download", callback_data=f"cancel_{uid}")]])
+                    await safe_edit(status_msg, make_progress_text("⬇️ Downloading...", 0, total, 0, 0), kb0)
 
-            with open(file_path, "wb") as f:
-                async for chunk in r.content.iter_chunked(CHUNK_SIZE):
-                    if uid in USER_CANCEL:
-                        raise asyncio.CancelledError
-                    if not chunk:
-                        continue
+                    with open(file_path, "wb") as f:
+                        async for chunk in r.content.iter_chunked(CHUNK_SIZE):
+                            if uid in USER_CANCEL:
+                                raise asyncio.CancelledError
+                            if not chunk:
+                                continue
 
-                    f.write(chunk)
-                    downloaded += len(chunk)
+                            f.write(chunk)
+                            downloaded += len(chunk)
 
-                    elapsed = time.time() - start_time
-                    speed = downloaded / elapsed if elapsed > 0 else 0
+                            elapsed = time.time() - start_time
+                            speed = downloaded / elapsed if elapsed > 0 else 0
+                            eta = (total - downloaded) / speed if (total and speed > 0) else 0
 
-                    # if server not giving total, show fake increasing bar by speed
-                    eta = (total - downloaded) / speed if (total and speed > 0) else 0
+                            now = time.time()
+                            if now - last_edit > 4:
+                                last_edit = now
+                                kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel Download", callback_data=f"cancel_{uid}")]])
+                                await safe_edit(
+                                    status_msg,
+                                    make_progress_text("⬇️ Downloading...", downloaded, total, speed, eta),
+                                    kb
+                                )
 
-                    now = time.time()
-                    if now - last_edit > 4:
-                        last_edit = now
-                        kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel Download", callback_data=f"cancel_{uid}")]])
-                        await safe_edit(
-                            status_msg,
-                            make_progress_text("⬇️ Downloading...", downloaded, total, speed, eta),
-                            kb
-                        )
+                    # ✅ success
+                    if downloaded > 0:
+                        return
 
-    # ✅ if stuck 0 bytes
-    if downloaded <= 0:
-        raise Exception("No data received from server. Try another link.")
+                    raise Exception("No data received from server.")
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            if attempt >= 3:
+                raise Exception(f"Download failed: {e}")
+            await safe_edit(status_msg, f"⚠️ Link slow/blocked. Retrying... ({attempt}/3)")
+            await asyncio.sleep(3)
+
+    raise Exception("Download failed.")
 
 
 def ffprobe_duration(path: str) -> float:
@@ -271,97 +293,6 @@ async def gen_thumbnail(input_path: str, out_thumb: str):
     return os.path.exists(out_thumb)
 
 
-def parse_ffmpeg_time_to_seconds(t: str):
-    try:
-        parts = t.split(":")
-        if len(parts) != 3:
-            return 0.0
-        h = float(parts[0])
-        m = float(parts[1])
-        s = float(parts[2])
-        return h * 3600 + m * 60 + s
-    except:
-        return 0.0
-
-
-# ✅ Fix seek reset issue
-async def fix_streaming_seek(input_path: str, status_msg, uid, USER_CANCEL: set):
-    if not input_path.lower().endswith(".mp4"):
-        return input_path
-
-    out_path = os.path.splitext(input_path)[0] + "_stream.mp4"
-    total_duration = ffprobe_duration(input_path)
-
-    kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_{uid}")]])
-    await safe_edit(status_msg, "⚡ Fixing Streaming (FastStart + Keyframes)...\n⏳ Please wait...", kb)
-
-    cmd = [
-        "ffmpeg", "-y",
-        "-fflags", "+genpts",
-        "-i", input_path,
-        "-avoid_negative_ts", "make_zero",
-        "-max_muxing_queue_size", "1024",
-        "-c:v", "libx264",
-        "-preset", "veryfast",
-        "-crf", "23",
-        "-g", "48",
-        "-keyint_min", "48",
-        "-sc_threshold", "0",
-        "-c:a", "aac",
-        "-b:a", "128k",
-        "-movflags", "+faststart",
-        out_path
-    ]
-
-    proc = await asyncio.create_subprocess_exec(
-        *cmd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.STDOUT
-    )
-
-    last_edit = 0
-    last_sec = 0.0
-
-    while True:
-        if uid in USER_CANCEL:
-            try:
-                proc.kill()
-            except:
-                pass
-            raise asyncio.CancelledError
-
-        line = await proc.stdout.readline()
-        if not line:
-            break
-
-        s = line.decode(errors="ignore")
-
-        if "time=" in s:
-            m = re.search(r"time=(\d+:\d+:\d+\.?\d*)", s)
-            if m:
-                last_sec = parse_ffmpeg_time_to_seconds(m.group(1))
-
-        now = time.time()
-        if now - last_edit > 8:  # reduce edit
-            last_edit = now
-            pct = 0
-            if total_duration and total_duration > 0:
-                pct = max(0, min(100, (last_sec / total_duration) * 100))
-            await safe_edit(status_msg, f"⚡ Fixing Streaming...\n\n{make_circle_bar(pct)}\n\n📊 **{pct:.2f}%**", kb)
-
-    await proc.wait()
-
-    if proc.returncode != 0 or not os.path.exists(out_path):
-        return input_path
-
-    try:
-        os.remove(input_path)
-    except:
-        pass
-
-    return out_path
-
-
 # ==========================
 # PUBLIC API FOR bot.py
 # ==========================
@@ -407,24 +338,17 @@ async def url_callback_router(client, cb, USER_TASKS, USER_CANCEL, get_or_create
             if uid in USER_CANCEL:
                 raise asyncio.CancelledError
 
-            upload_path = file_path
-
-            # Fix mp4 streaming seek issue
-            if mode == "video" and file_path.lower().endswith(".mp4"):
-                upload_path = await fix_streaming_seek(file_path, status, uid, USER_CANCEL)
-
-            size = os.path.getsize(upload_path)
+            size = os.path.getsize(file_path)
             up_start = time.time()
 
             if mode == "video":
-                thumb = os.path.splitext(upload_path)[0] + "_thumb.jpg"
+                thumb = os.path.splitext(file_path)[0] + "_thumb.jpg"
                 try:
-                    await gen_thumbnail(upload_path, thumb)
+                    await gen_thumbnail(file_path, thumb)
                 except:
                     thumb = None
 
-                dur, w, h = ffprobe_video_info(upload_path)
-
+                dur, w, h = ffprobe_video_info(file_path)
                 args = {}
                 if dur > 0: args["duration"] = dur
                 if w > 0: args["width"] = w
@@ -433,7 +357,7 @@ async def url_callback_router(client, cb, USER_TASKS, USER_CANCEL, get_or_create
                 await safe_edit(status, "📤 Upload Starting...")
                 await client.send_video(
                     chat_id=cb.message.chat.id,
-                    video=upload_path,
+                    video=file_path,
                     caption=f"✅ Uploaded 🎥\n\n📌 `{name_clean}`\n📦 {naturalsize(size)}",
                     supports_streaming=True,
                     thumb=thumb if thumb and os.path.exists(thumb) else None,
@@ -445,7 +369,7 @@ async def url_callback_router(client, cb, USER_TASKS, USER_CANCEL, get_or_create
                 await safe_edit(status, "📤 Upload Starting...")
                 await client.send_document(
                     chat_id=cb.message.chat.id,
-                    document=upload_path,
+                    document=file_path,
                     caption=f"✅ Uploaded 📁\n\n📌 `{name_clean}`\n📦 {naturalsize(size)}",
                     progress=upload_progress,
                     progress_args=(status, uid, up_start, USER_CANCEL)
