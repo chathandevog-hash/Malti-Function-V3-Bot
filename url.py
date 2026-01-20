@@ -9,7 +9,11 @@ from urllib.parse import urlparse, unquote
 
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
+# -------------------------
+# Config
+# -------------------------
 DOWNLOAD_DIR = os.getenv("DOWNLOAD_DIR", "downloads")
+
 URL_UPLOAD_LIMIT = 2 * 1024 * 1024 * 1024  # ✅ 2GB
 CHUNK_SIZE = 1024 * 256
 
@@ -62,7 +66,7 @@ def format_time(seconds: float):
     return f"{s}s"
 
 
-# ✅ UI SAME (your old bar style)
+# ✅ UI same bar style
 def make_circle_bar(percent: float, slots: int = 14):
     percent = max(0, min(100, percent))
     filled = int((percent / 100) * slots)
@@ -149,39 +153,36 @@ async def get_filename_and_size(url: str):
 
 
 # -------------------------
-# FFMPEG ✅ (check + warn)
+# FFMPEG
 # -------------------------
 def _ffmpeg_exists():
     try:
-        subprocess.run(["ffmpeg", "-version"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
-        subprocess.run(["ffprobe", "-version"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+        subprocess.run(["ffmpeg", "-version"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(["ffprobe", "-version"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         return True
     except:
         return False
 
 
-def ffmpeg_debug_text():
-    try:
-        out = subprocess.check_output(["ffmpeg", "-version"]).decode(errors="ignore").splitlines()[0]
-        return out.strip()
-    except:
-        return "ffmpeg not found"
-
-
 def ensure_mp4_faststart(input_path: str):
     """
-    ✅ Streaming fix:
-    - If ffmpeg missing -> no conversion
-    - Remux faststart (moov atom start)
+    ✅ Fix resume/seek:
+    - remux faststart first
+    - if fails -> encode mp4 H264/AAC faststart (guaranteed)
+    - big files encode skip (Render free safe)
     """
     if not _ffmpeg_exists():
         return input_path
 
-    out_path = input_path + "_fixed.mp4"
+    try:
+        size = os.path.getsize(input_path)
+    except:
+        size = 0
 
+    # ✅ remux/copy faststart
+    out_path = input_path + "_fast.mp4"
     cmd = [
-        "ffmpeg", "-y",
-        "-i", input_path,
+        "ffmpeg", "-y", "-i", input_path,
         "-map", "0",
         "-c", "copy",
         "-movflags", "+faststart",
@@ -195,6 +196,30 @@ def ensure_mp4_faststart(input_path: str):
         except:
             pass
         return out_path
+
+    # ✅ Render free: big file encode skip
+    if size > 800 * 1024 * 1024:
+        return input_path
+
+    # ✅ encode fallback
+    out2 = input_path + "_encode.mp4"
+    cmd2 = [
+        "ffmpeg", "-y",
+        "-i", input_path,
+        "-map", "0",
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+        "-c:a", "aac", "-b:a", "128k",
+        "-movflags", "+faststart",
+        out2
+    ]
+    subprocess.run(cmd2, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    if os.path.exists(out2) and os.path.getsize(out2) > 0:
+        try:
+            os.remove(input_path)
+        except:
+            pass
+        return out2
 
     return input_path
 
@@ -260,6 +285,8 @@ async def download_stream(url, file_path, status_msg, uid, USER_CANCEL: set):
     start_time = time.time()
     last_edit = 0
     total = 0
+
+    # ✅ stall watch
     last_chunk_time = time.time()
 
     async with aiohttp.ClientSession(timeout=timeout) as session:
@@ -288,11 +315,13 @@ async def download_stream(url, file_path, status_msg, uid, USER_CANCEL: set):
                         raise asyncio.CancelledError
 
                     if not chunk:
+                        # ✅ stalled
                         if time.time() - last_chunk_time > 60:
                             raise Exception("Download stalled (no data). Try again.")
                         continue
 
                     last_chunk_time = time.time()
+
                     f.write(chunk)
                     downloaded += len(chunk)
 
@@ -321,6 +350,7 @@ async def url_flow(client, message, url: str):
         [InlineKeyboardButton("⬅️ Back", callback_data="back_main")]
     ])
 
+    # ✅ FloodWait safe: try edit else reply
     try:
         await message.edit_text("✅ URL Detected 🌐\n\n👇 Choose upload type:", reply_markup=kb)
     except:
@@ -347,7 +377,9 @@ async def url_callback_router(
 
     await cb.answer("⏳ Processing...", show_alert=False)
 
+    # ✅ status message (bot.py controls new/clear)
     status = await get_or_create_status(cb.message, uid)
+
     await safe_edit(status, "⏳ Processing started...\n\n⬇️ Preparing download...")
     await asyncio.sleep(0.2)
 
@@ -363,6 +395,7 @@ async def url_callback_router(
 
             file_path = os.path.join(DOWNLOAD_DIR, f"url_{uid}_{int(time.time())}_{fname}")
 
+            # ✅ Download
             await download_stream(url, file_path, status, uid, USER_CANCEL)
 
             if uid in USER_CANCEL:
@@ -370,15 +403,8 @@ async def url_callback_router(
 
             size = os.path.getsize(file_path)
 
+            # ✅ Video fixes
             if mode == "video":
-                if not _ffmpeg_exists():
-                    raise Exception(
-                        "FFmpeg missing on server ❌\n\n"
-                        "Streaming/Resume may not work.\n"
-                        "Install ffmpeg in Render build command.\n\n"
-                        f"Debug: `{ffmpeg_debug_text()}`"
-                    )
-
                 await safe_edit(status, "🎥 Converting to MP4 + Streaming Fix...\n\n⏳ Please wait...")
                 file_path = ensure_mp4_faststart(file_path)
                 name_clean = clean_display_name(os.path.basename(file_path))
@@ -386,6 +412,7 @@ async def url_callback_router(
                 await safe_edit(status, "🖼 Generating Thumbnail (Middle Frame)...\n\n⏳ Please wait...")
                 thumb_path = generate_middle_thumbnail(file_path)
 
+            # ✅ Upload
             up_start = time.time()
 
             if mode == "video":
