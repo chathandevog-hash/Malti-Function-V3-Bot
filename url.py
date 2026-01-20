@@ -13,10 +13,13 @@ DOWNLOAD_DIR = os.getenv("DOWNLOAD_DIR", "downloads")
 URL_UPLOAD_LIMIT = 2 * 1024 * 1024 * 1024  # ✅ 2GB
 CHUNK_SIZE = 1024 * 256
 
-URL_STATE = {}
-PROGRESS_LAST_EDIT = {}
+URL_STATE = {}              # uid -> url
+PROGRESS_LAST_EDIT = {}     # uid -> last edit time
 
 
+# -------------------------
+# Utils
+# -------------------------
 def is_url(text: str):
     return (text or "").startswith("http://") or (text or "").startswith("https://")
 
@@ -59,7 +62,7 @@ def format_time(seconds: float):
     return f"{s}s"
 
 
-# ✅ UI SAME
+# ✅ UI SAME (your old bar style)
 def make_circle_bar(percent: float, slots: int = 14):
     percent = max(0, min(100, percent))
     filled = int((percent / 100) * slots)
@@ -113,6 +116,9 @@ async def safe_edit(msg, text, reply_markup=None):
         pass
 
 
+# -------------------------
+# URL meta
+# -------------------------
 async def get_filename_and_size(url: str):
     filename = None
     total = 0
@@ -142,88 +148,53 @@ async def get_filename_and_size(url: str):
     return safe_filename(filename), total
 
 
+# -------------------------
+# FFMPEG ✅ (check + warn)
+# -------------------------
 def _ffmpeg_exists():
     try:
-        subprocess.run(["ffmpeg", "-version"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        subprocess.run(["ffprobe", "-version"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(["ffmpeg", "-version"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+        subprocess.run(["ffprobe", "-version"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
         return True
     except:
         return False
 
 
+def ffmpeg_debug_text():
+    try:
+        out = subprocess.check_output(["ffmpeg", "-version"]).decode(errors="ignore").splitlines()[0]
+        return out.strip()
+    except:
+        return "ffmpeg not found"
+
+
 def ensure_mp4_faststart(input_path: str):
     """
-    ✅ Resume fix like other bot:
-    - remux faststart first
-    - if <= 300MB => force encode H264/AAC faststart (guaranteed)
-    - if big => encode skip (Render safe)
+    ✅ Streaming fix:
+    - If ffmpeg missing -> no conversion
+    - Remux faststart (moov atom start)
     """
     if not _ffmpeg_exists():
         return input_path
 
-    try:
-        size = os.path.getsize(input_path)
-    except:
-        size = 0
+    out_path = input_path + "_fixed.mp4"
 
-    # ✅ remux always
-    out_fast = input_path + "_fast.mp4"
     cmd = [
         "ffmpeg", "-y",
         "-i", input_path,
         "-map", "0",
         "-c", "copy",
         "-movflags", "+faststart",
-        out_fast
+        out_path
     ]
     subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-    if os.path.exists(out_fast) and os.path.getsize(out_fast) > 0:
-        # ✅ big -> keep remux only
-        if size > 300 * 1024 * 1024:
-            try:
-                os.remove(input_path)
-            except:
-                pass
-            return out_fast
-
-    # ✅ if big encode skip
-    if size > 300 * 1024 * 1024:
-        return out_fast if os.path.exists(out_fast) else input_path
-
-    # ✅ small -> force encode (guaranteed resume)
-    out_enc = input_path + "_encode.mp4"
-    cmd2 = [
-        "ffmpeg", "-y",
-        "-i", input_path,
-        "-map", "0",
-        "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
-        "-pix_fmt", "yuv420p",
-        "-c:a", "aac", "-b:a", "128k",
-        "-movflags", "+faststart",
-        out_enc
-    ]
-    subprocess.run(cmd2, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
-    if os.path.exists(out_enc) and os.path.getsize(out_enc) > 0:
+    if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
         try:
             os.remove(input_path)
         except:
             pass
-        try:
-            if os.path.exists(out_fast):
-                os.remove(out_fast)
-        except:
-            pass
-        return out_enc
-
-    # fallback
-    if os.path.exists(out_fast) and os.path.getsize(out_fast) > 0:
-        try:
-            os.remove(input_path)
-        except:
-            pass
-        return out_fast
+        return out_path
 
     return input_path
 
@@ -257,6 +228,9 @@ def generate_middle_thumbnail(video_path: str):
     return None
 
 
+# -------------------------
+# PROGRESS
+# -------------------------
 async def upload_progress(current, total, status_msg, uid, start_time, USER_CANCEL: set):
     if uid in USER_CANCEL:
         raise asyncio.CancelledError
@@ -274,6 +248,9 @@ async def upload_progress(current, total, status_msg, uid, start_time, USER_CANC
 
 
 async def download_stream(url, file_path, status_msg, uid, USER_CANCEL: set):
+    """
+    ✅ Fix stuck: stall timeout detector
+    """
     USER_CANCEL.discard(uid)
 
     timeout = aiohttp.ClientTimeout(sock_connect=30, sock_read=30, total=None)
@@ -283,7 +260,6 @@ async def download_stream(url, file_path, status_msg, uid, USER_CANCEL: set):
     start_time = time.time()
     last_edit = 0
     total = 0
-
     last_chunk_time = time.time()
 
     async with aiohttp.ClientSession(timeout=timeout) as session:
@@ -317,7 +293,6 @@ async def download_stream(url, file_path, status_msg, uid, USER_CANCEL: set):
                         continue
 
                     last_chunk_time = time.time()
-
                     f.write(chunk)
                     downloaded += len(chunk)
 
@@ -331,6 +306,9 @@ async def download_stream(url, file_path, status_msg, uid, USER_CANCEL: set):
                         await safe_edit(status_msg, make_progress_text("⬇️ Downloading...", downloaded, total, speed, eta), kb)
 
 
+# -------------------------
+# PUBLIC API
+# -------------------------
 async def url_flow(client, message, url: str):
     uid = message.from_user.id
     URL_STATE[uid] = url
@@ -349,7 +327,15 @@ async def url_flow(client, message, url: str):
         await message.reply("✅ URL Detected 🌐\n\n👇 Choose upload type:", reply_markup=kb)
 
 
-async def url_callback_router(client, cb, USER_TASKS, USER_CANCEL, get_or_create_status, main_menu_keyboard, DOWNLOAD_DIR):
+async def url_callback_router(
+    client,
+    cb,
+    USER_TASKS,
+    USER_CANCEL,
+    get_or_create_status,
+    main_menu_keyboard,
+    DOWNLOAD_DIR
+):
     uid = cb.from_user.id
     data = cb.data
 
@@ -368,11 +354,13 @@ async def url_callback_router(client, cb, USER_TASKS, USER_CANCEL, get_or_create
     async def job():
         file_path = None
         thumb_path = None
+
         try:
             USER_CANCEL.discard(uid)
 
             fname, _ = await get_filename_and_size(url)
             name_clean = clean_display_name(fname)
+
             file_path = os.path.join(DOWNLOAD_DIR, f"url_{uid}_{int(time.time())}_{fname}")
 
             await download_stream(url, file_path, status, uid, USER_CANCEL)
@@ -383,6 +371,14 @@ async def url_callback_router(client, cb, USER_TASKS, USER_CANCEL, get_or_create
             size = os.path.getsize(file_path)
 
             if mode == "video":
+                if not _ffmpeg_exists():
+                    raise Exception(
+                        "FFmpeg missing on server ❌\n\n"
+                        "Streaming/Resume may not work.\n"
+                        "Install ffmpeg in Render build command.\n\n"
+                        f"Debug: `{ffmpeg_debug_text()}`"
+                    )
+
                 await safe_edit(status, "🎥 Converting to MP4 + Streaming Fix...\n\n⏳ Please wait...")
                 file_path = ensure_mp4_faststart(file_path)
                 name_clean = clean_display_name(os.path.basename(file_path))
@@ -417,8 +413,10 @@ async def url_callback_router(client, cb, USER_TASKS, USER_CANCEL, get_or_create
 
         except asyncio.CancelledError:
             await safe_edit(status, "❌ Cancelled ✅", reply_markup=main_menu_keyboard())
+
         except Exception as e:
             await safe_edit(status, f"❌ URL Upload Failed!\n\nError: `{e}`", reply_markup=main_menu_keyboard())
+
         finally:
             URL_STATE.pop(uid, None)
             USER_CANCEL.discard(uid)
@@ -428,6 +426,7 @@ async def url_callback_router(client, cb, USER_TASKS, USER_CANCEL, get_or_create
                     os.remove(thumb_path)
             except:
                 pass
+
             try:
                 if file_path and os.path.exists(file_path):
                     os.remove(file_path)
