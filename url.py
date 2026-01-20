@@ -14,6 +14,7 @@ URL_UPLOAD_LIMIT = 2 * 1024 * 1024 * 1024  # ✅ 2GB
 CHUNK_SIZE = 1024 * 256
 
 URL_STATE = {}  # uid -> url session
+PROGRESS_LAST_EDIT = {}  # ✅ uid -> last edit time (fix)
 
 
 # -------------------------
@@ -156,6 +157,11 @@ def _ffmpeg_exists():
 
 
 def ensure_mp4_faststart(input_path: str):
+    """
+    ✅ Fix seek/resume in Telegram player:
+    - Always output mp4
+    - move moov atom to start
+    """
     if not _ffmpeg_exists():
         return input_path
 
@@ -171,7 +177,7 @@ def ensure_mp4_faststart(input_path: str):
             pass
         return out_path
 
-    # fallback encode
+    # ✅ fallback encode (guaranteed faststart)
     out2 = input_path + "_encode.mp4"
     cmd2 = [
         "ffmpeg", "-y",
@@ -237,14 +243,11 @@ async def upload_progress(current, total, status_msg, uid, start_time, USER_CANC
     eta = (total - current) / speed if speed > 0 else 0
 
     now = time.time()
-    if not hasattr(status_msg, "_last_edit"):
-        status_msg._last_edit = 0
+    last = PROGRESS_LAST_EDIT.get(uid, 0)
 
-    if now - status_msg._last_edit > 3:
-        status_msg._last_edit = now
-        kb = InlineKeyboardMarkup(
-            [[InlineKeyboardButton("❌ Cancel Upload", callback_data=f"cancel_{uid}")]]
-        )
+    if now - last > 3:
+        PROGRESS_LAST_EDIT[uid] = now
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel Upload", callback_data=f"cancel_{uid}")]])
         await safe_edit(status_msg, make_progress_text("📤 Uploading...", current, total, speed, eta), kb)
 
 
@@ -270,9 +273,7 @@ async def download_stream(url, file_path, status_msg, uid, USER_CANCEL: set):
 
             os.makedirs(os.path.dirname(file_path), exist_ok=True)
 
-            kb0 = InlineKeyboardMarkup(
-                [[InlineKeyboardButton("❌ Cancel Download", callback_data=f"cancel_{uid}")]]
-            )
+            kb0 = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel Download", callback_data=f"cancel_{uid}")]])
             await safe_edit(status_msg, make_progress_text("⬇️ Downloading...", 0, total, 0, 0), kb0)
 
             with open(file_path, "wb") as f:
@@ -291,14 +292,8 @@ async def download_stream(url, file_path, status_msg, uid, USER_CANCEL: set):
 
                     if time.time() - last_edit > 3:
                         last_edit = time.time()
-                        kb = InlineKeyboardMarkup(
-                            [[InlineKeyboardButton("❌ Cancel Download", callback_data=f"cancel_{uid}")]]
-                        )
-                        await safe_edit(
-                            status_msg,
-                            make_progress_text("⬇️ Downloading...", downloaded, total, speed, eta),
-                            kb
-                        )
+                        kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel Download", callback_data=f"cancel_{uid}")]])
+                        await safe_edit(status_msg, make_progress_text("⬇️ Downloading...", downloaded, total, speed, eta), kb)
 
 
 # -------------------------
@@ -309,8 +304,10 @@ async def url_flow(client, message, url: str):
     URL_STATE[uid] = url
 
     kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("🎥 Video Upload (MP4)", callback_data="url_send_video"),
-         InlineKeyboardButton("📁 File Upload", callback_data="url_send_file")],
+        [
+            InlineKeyboardButton("🎥 Video Upload (MP4)", callback_data="url_send_video"),
+            InlineKeyboardButton("📁 File Upload", callback_data="url_send_file")
+        ],
         [InlineKeyboardButton("⬅️ Back", callback_data="back_main")]
     ])
     await message.reply("✅ URL Detected 🌐\n\n👇 Choose upload type:", reply_markup=kb)
@@ -329,19 +326,16 @@ async def url_callback_router(
     data = cb.data
 
     if uid not in URL_STATE:
-        return await cb.message.edit(
-            "❌ Session expired. Send URL again.",
-            reply_markup=main_menu_keyboard()
-        )
+        return await cb.message.edit("❌ Session expired. Send URL again.", reply_markup=main_menu_keyboard())
 
     url = URL_STATE[uid]
     mode = "video" if data == "url_send_video" else "file"
 
-    # ✅ IMPORTANT: Processing UI GUARANTEED
     await cb.answer("⏳ Processing...", show_alert=False)
-    status = await get_or_create_status(cb.message, uid)
-    await safe_edit(status, "⏳ Processing started...\n\n⬇️ Preparing download...")
-    await asyncio.sleep(0.5)
+
+    # ✅ FIX: always create new status message (no edit conflict)
+    status = await cb.message.reply("⏳ Processing started...\n\n⬇️ Preparing download...")
+    await asyncio.sleep(0.3)
 
     async def job():
         file_path = None
@@ -352,10 +346,9 @@ async def url_callback_router(
 
             fname, _ = await get_filename_and_size(url)
             name_clean = clean_display_name(fname)
-
             file_path = os.path.join(DOWNLOAD_DIR, f"url_{uid}_{int(time.time())}_{fname}")
 
-            # 1) download
+            # download
             await download_stream(url, file_path, status, uid, USER_CANCEL)
 
             if uid in USER_CANCEL:
@@ -363,7 +356,7 @@ async def url_callback_router(
 
             size = os.path.getsize(file_path)
 
-            # 2) mp4 + faststart + thumbnail
+            # video fix
             if mode == "video":
                 await safe_edit(status, "🎥 Converting to MP4 + Streaming Fix...\n\n⏳ Please wait...")
                 file_path = ensure_mp4_faststart(file_path)
@@ -372,7 +365,7 @@ async def url_callback_router(
                 await safe_edit(status, "🖼 Generating Thumbnail (Middle Frame)...\n\n⏳ Please wait...")
                 thumb_path = generate_middle_thumbnail(file_path)
 
-            # 3) upload
+            # upload
             up_start = time.time()
 
             if mode == "video":
