@@ -66,7 +66,11 @@ async def safe_answer(cb, text="✅"):
 # HELPERS
 # ===========================
 async def get_or_create_status(message, uid):
-    # ✅ Always create new message to avoid edit conflict
+    """
+    ✅ Reuse one status msg per user (FloodWait avoid)
+    """
+    if uid in UI_STATUS_MSG:
+        return UI_STATUS_MSG[uid]
     status = await safe_send(message, "⏳ Processing...")
     UI_STATUS_MSG[uid] = status
     return status
@@ -186,7 +190,6 @@ async def cancel_task(client, cb):
 async def all_callbacks(client, cb):
     data = cb.data
 
-    # ✅ URL uploader callbacks
     if data.startswith("url_"):
         return await url_callback_router(
             client, cb,
