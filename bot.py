@@ -13,9 +13,6 @@ from config import BOT_TOKEN, API_ID, API_HASH, DOWNLOAD_DIR
 from url import is_url, url_flow, url_callback_router
 from insta import is_instagram_url, clean_insta_url, insta_entry
 
-# ✅ Spotify module (AUTO START)
-from spotify import is_spotify_url, spotify_auto_download
-
 
 # ===========================
 # GLOBALS
@@ -81,9 +78,6 @@ def main_menu_keyboard():
         [
             InlineKeyboardButton("🌐 URL Uploader", callback_data="menu_url"),
             InlineKeyboardButton("📸 Instagram", callback_data="menu_insta")
-        ],
-        [
-            InlineKeyboardButton("🎧 Spotify", callback_data="menu_spotify")
         ]
     ])
 
@@ -99,12 +93,11 @@ WELCOME_TEXT = (
     "⚠️ Limit: **2GB**\n\n"
     "📸 **Instagram Reel Downloader**\n"
     "➜ Send Reel link ✅\n\n"
-    "🎧 **Spotify Music Downloader**\n"
-    "➜ Send Spotify link ✅ (Auto Start)\n\n"
     "📌 How to use?\n"
-    "1️⃣ Send a URL / Insta / Spotify link\n"
-    "2️⃣ Wait processing ⏳\n"
-    "3️⃣ Get output 🎉\n\n"
+    "1️⃣ Select Menu\n"
+    "2️⃣ Send URL / Insta link\n"
+    "3️⃣ Wait processing ⏳\n"
+    "4️⃣ Get output 🎉\n\n"
     "🚀 Now send something to start 👇😊"
 )
 
@@ -167,14 +160,6 @@ async def menu_insta(client, cb):
     await guarded_menu_edit(cb, uid, "📸 **Instagram Mode**\n\nSend Reel URL 👇")
 
 
-@app.on_callback_query(filters.regex("^menu_spotify$"))
-async def menu_spotify(client, cb):
-    uid = cb.from_user.id
-    USER_STATE[uid] = "WAIT_SPOTIFY"
-    await safe_answer(cb)
-    await guarded_menu_edit(cb, uid, "🎧 **Spotify Mode**\n\nSend Spotify link 👇 (Auto Start)")
-
-
 # ===========================
 # CANCEL
 # ===========================
@@ -226,25 +211,11 @@ async def text_handler(client, message):
     if text.startswith("/"):
         return
 
-    # ✅ Spotify auto detect + Auto start
-    if is_spotify_url(text):
-        USER_STATE[uid] = "WAIT_SPOTIFY"
-        return await spotify_auto_download(
-            client,
-            message,
-            text,
-            USER_TASKS,
-            USER_CANCEL,
-            get_or_create_status,
-            main_menu_keyboard,
-            DOWNLOAD_DIR
-        )
-
-    # ✅ Insta auto
+    # ✅ Insta auto detect
     if is_instagram_url(text):
         return await insta_entry(client, message, clean_insta_url(text), USER_TASKS, main_menu_keyboard)
 
-    # ✅ URL auto
+    # ✅ URL auto detect
     if is_url(text):
         USER_STATE[uid] = "WAIT_URL"
         return await url_flow(client, message, text)
@@ -258,20 +229,6 @@ async def text_handler(client, message):
         if is_instagram_url(text):
             return await insta_entry(client, message, clean_insta_url(text), USER_TASKS, main_menu_keyboard)
         return await safe_send(message, "❌ Instagram Reel link ayakku ✅", reply_markup=back_keyboard())
-
-    if state == "WAIT_SPOTIFY":
-        if is_spotify_url(text):
-            return await spotify_auto_download(
-                client,
-                message,
-                text,
-                USER_TASKS,
-                USER_CANCEL,
-                get_or_create_status,
-                main_menu_keyboard,
-                DOWNLOAD_DIR
-            )
-        return await safe_send(message, "❌ Spotify music link ayakku ✅", reply_markup=back_keyboard())
 
     # anti spam
     now = time.time()
