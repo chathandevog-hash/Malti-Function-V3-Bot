@@ -17,9 +17,6 @@ URL_STATE = {}
 PROGRESS_LAST_EDIT = {}
 
 
-# -------------------------
-# Utils
-# -------------------------
 def is_url(text: str):
     return (text or "").startswith("http://") or (text or "").startswith("https://")
 
@@ -144,9 +141,6 @@ async def get_filename_and_size(url: str):
     return safe_filename(filename), total
 
 
-# -------------------------
-# FFMPEG
-# -------------------------
 def _ffmpeg_exists():
     try:
         subprocess.run(["ffmpeg", "-version"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -170,6 +164,25 @@ def ensure_mp4_faststart(input_path: str):
         except:
             pass
         return out_path
+
+    # ✅ fallback encode (better seek)
+    out2 = input_path + "_encode.mp4"
+    cmd2 = [
+        "ffmpeg", "-y",
+        "-i", input_path,
+        "-c:v", "libx264", "-preset", "veryfast",
+        "-c:a", "aac", "-b:a", "128k",
+        "-movflags", "+faststart",
+        out2
+    ]
+    subprocess.run(cmd2, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    if os.path.exists(out2) and os.path.getsize(out2) > 0:
+        try:
+            os.remove(input_path)
+        except:
+            pass
+        return out2
 
     return input_path
 
@@ -204,9 +217,6 @@ def generate_middle_thumbnail(video_path: str):
     return None
 
 
-# -------------------------
-# Progress
-# -------------------------
 async def upload_progress(current, total, status_msg, uid, start_time, USER_CANCEL: set):
     if uid in USER_CANCEL:
         raise asyncio.CancelledError
@@ -225,13 +235,16 @@ async def upload_progress(current, total, status_msg, uid, start_time, USER_CANC
 
 async def download_stream(url, file_path, status_msg, uid, USER_CANCEL: set):
     USER_CANCEL.discard(uid)
-    timeout = aiohttp.ClientTimeout(total=None)
+
+    # ✅ prevent stuck
+    timeout = aiohttp.ClientTimeout(sock_connect=30, sock_read=30, total=None)
 
     downloaded = 0
     start_time = time.time()
     last_edit = 0
     total = 0
 
+    last_chunk_time = time.time()
     headers = {"User-Agent": "Mozilla/5.0"}
 
     async with aiohttp.ClientSession(timeout=timeout) as session:
@@ -239,7 +252,6 @@ async def download_stream(url, file_path, status_msg, uid, USER_CANCEL: set):
             if r.status != 200:
                 raise Exception(f"HTTP {r.status}")
 
-            # ❗ detect html page
             ctype = (r.headers.get("Content-Type") or "").lower()
             if "text/html" in ctype:
                 raise Exception("URL is not a direct file link (HTML page detected)")
@@ -259,8 +271,13 @@ async def download_stream(url, file_path, status_msg, uid, USER_CANCEL: set):
                 async for chunk in r.content.iter_chunked(CHUNK_SIZE):
                     if uid in USER_CANCEL:
                         raise asyncio.CancelledError
+
                     if not chunk:
+                        if time.time() - last_chunk_time > 60:
+                            raise Exception("Download stalled (no data). Try again.")
                         continue
+
+                    last_chunk_time = time.time()
 
                     f.write(chunk)
                     downloaded += len(chunk)
@@ -275,9 +292,6 @@ async def download_stream(url, file_path, status_msg, uid, USER_CANCEL: set):
                         await safe_edit(status_msg, make_progress_text("⬇️ Downloading...", downloaded, total, speed, eta), kb)
 
 
-# -------------------------
-# Public API
-# -------------------------
 async def url_flow(client, message, url: str):
     uid = message.from_user.id
     URL_STATE[uid] = url
@@ -289,7 +303,12 @@ async def url_flow(client, message, url: str):
         ],
         [InlineKeyboardButton("⬅️ Back", callback_data="back_main")]
     ])
-    await message.reply("✅ URL Detected 🌐\n\n👇 Choose upload type:", reply_markup=kb)
+
+    # ✅ FloodWait safe: try edit else reply
+    try:
+        await message.edit_text("✅ URL Detected 🌐\n\n👇 Choose upload type:", reply_markup=kb)
+    except:
+        await message.reply("✅ URL Detected 🌐\n\n👇 Choose upload type:", reply_markup=kb)
 
 
 async def url_callback_router(
@@ -312,7 +331,9 @@ async def url_callback_router(
 
     await cb.answer("⏳ Processing...", show_alert=False)
 
-    status = await cb.message.reply("⏳ Processing started...\n\n⬇️ Preparing download...")
+    # ✅ reuse status msg (no spam)
+    status = await get_or_create_status(cb.message, uid)
+    await safe_edit(status, "⏳ Processing started...\n\n⬇️ Preparing download...")
     await asyncio.sleep(0.2)
 
     async def job():
