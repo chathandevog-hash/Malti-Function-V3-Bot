@@ -13,7 +13,6 @@ from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 # Config
 # -------------------------
 DOWNLOAD_DIR = os.getenv("DOWNLOAD_DIR", "downloads")
-
 URL_UPLOAD_LIMIT = 2 * 1024 * 1024 * 1024  # ✅ 2GB
 CHUNK_SIZE = 1024 * 256
 
@@ -66,7 +65,7 @@ def format_time(seconds: float):
     return f"{s}s"
 
 
-# ✅ UI same bar style
+# ✅ UI same bar style (unchanged)
 def make_circle_bar(percent: float, slots: int = 14):
     percent = max(0, min(100, percent))
     filled = int((percent / 100) * slots)
@@ -164,30 +163,80 @@ def _ffmpeg_exists():
         return False
 
 
-def ensure_mp4_faststart(input_path: str):
+def ffprobe_video_info(path: str):
     """
-    ✅ Fix resume/seek:
-    - remux faststart first
-    - if fails -> encode mp4 H264/AAC faststart (guaranteed)
-    - big files encode skip (Render free safe)
+    ✅ OLD FEATURE: needed for Telegram streaming + resume
+    returns: (duration, width, height)
+    """
+    if not _ffmpeg_exists():
+        return (0, 0, 0)
+
+    try:
+        cmd = [
+            "ffprobe", "-v", "error",
+            "-select_streams", "v:0",
+            "-show_entries", "stream=width,height",
+            "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+            path
+        ]
+        out = subprocess.check_output(cmd, stderr=subprocess.DEVNULL).decode(errors="ignore").strip().splitlines()
+        # output order can vary => parse safely
+        dur = 0
+        w = 0
+        h = 0
+        for line in out:
+            line = line.strip()
+            if "." in line and dur == 0:
+                try:
+                    dur = int(float(line))
+                except:
+                    pass
+            else:
+                try:
+                    v = int(line)
+                    if w == 0:
+                        w = v
+                    elif h == 0:
+                        h = v
+                except:
+                    pass
+        return (dur, w, h)
+    except:
+        return (0, 0, 0)
+
+
+def fix_streaming_seek(input_path: str):
+    """
+    🔥 OLD BEST FEATURE:
+    Telegram resume/seek fix (re-encode with keyframes + genpts + faststart)
+    Works more than remux.
     """
     if not _ffmpeg_exists():
         return input_path
 
-    try:
-        size = os.path.getsize(input_path)
-    except:
-        size = 0
+    out_path = input_path + "_seekfix.mp4"
 
-    # ✅ remux/copy faststart
-    out_path = input_path + "_fast.mp4"
+    # ✅ Very important flags for Telegram seek/resume
     cmd = [
-        "ffmpeg", "-y", "-i", input_path,
+        "ffmpeg", "-y",
+        "-fflags", "+genpts",
+        "-i", input_path,
+        "-avoid_negative_ts", "make_zero",
         "-map", "0",
-        "-c", "copy",
+        "-c:v", "libx264",
+        "-preset", "veryfast",
+        "-crf", "23",
+        "-pix_fmt", "yuv420p",
+        "-g", "48",
+        "-keyint_min", "48",
+        "-sc_threshold", "0",
+        "-c:a", "aac",
+        "-b:a", "128k",
         "-movflags", "+faststart",
         out_path
     ]
+
     subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
@@ -196,30 +245,6 @@ def ensure_mp4_faststart(input_path: str):
         except:
             pass
         return out_path
-
-    # ✅ Render free: big file encode skip
-    if size > 800 * 1024 * 1024:
-        return input_path
-
-    # ✅ encode fallback
-    out2 = input_path + "_encode.mp4"
-    cmd2 = [
-        "ffmpeg", "-y",
-        "-i", input_path,
-        "-map", "0",
-        "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
-        "-c:a", "aac", "-b:a", "128k",
-        "-movflags", "+faststart",
-        out2
-    ]
-    subprocess.run(cmd2, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
-    if os.path.exists(out2) and os.path.getsize(out2) > 0:
-        try:
-            os.remove(input_path)
-        except:
-            pass
-        return out2
 
     return input_path
 
@@ -274,7 +299,7 @@ async def upload_progress(current, total, status_msg, uid, start_time, USER_CANC
 
 async def download_stream(url, file_path, status_msg, uid, USER_CANCEL: set):
     """
-    ✅ Fix stuck: stall timeout detector
+    ✅ NEW: Fix stuck with stall timeout detector
     """
     USER_CANCEL.discard(uid)
 
@@ -286,7 +311,6 @@ async def download_stream(url, file_path, status_msg, uid, USER_CANCEL: set):
     last_edit = 0
     total = 0
 
-    # ✅ stall watch
     last_chunk_time = time.time()
 
     async with aiohttp.ClientSession(timeout=timeout) as session:
@@ -315,13 +339,11 @@ async def download_stream(url, file_path, status_msg, uid, USER_CANCEL: set):
                         raise asyncio.CancelledError
 
                     if not chunk:
-                        # ✅ stalled
                         if time.time() - last_chunk_time > 60:
                             raise Exception("Download stalled (no data). Try again.")
                         continue
 
                     last_chunk_time = time.time()
-
                     f.write(chunk)
                     downloaded += len(chunk)
 
@@ -350,7 +372,6 @@ async def url_flow(client, message, url: str):
         [InlineKeyboardButton("⬅️ Back", callback_data="back_main")]
     ])
 
-    # ✅ FloodWait safe: try edit else reply
     try:
         await message.edit_text("✅ URL Detected 🌐\n\n👇 Choose upload type:", reply_markup=kb)
     except:
@@ -377,9 +398,7 @@ async def url_callback_router(
 
     await cb.answer("⏳ Processing...", show_alert=False)
 
-    # ✅ status message (bot.py controls new/clear)
     status = await get_or_create_status(cb.message, uid)
-
     await safe_edit(status, "⏳ Processing started...\n\n⬇️ Preparing download...")
     await asyncio.sleep(0.2)
 
@@ -392,7 +411,6 @@ async def url_callback_router(
 
             fname, _ = await get_filename_and_size(url)
             name_clean = clean_display_name(fname)
-
             file_path = os.path.join(DOWNLOAD_DIR, f"url_{uid}_{int(time.time())}_{fname}")
 
             # ✅ Download
@@ -403,10 +421,15 @@ async def url_callback_router(
 
             size = os.path.getsize(file_path)
 
-            # ✅ Video fixes
+            # ✅ Video pipeline (OLD seek fix restore)
+            dur = w = h = 0
             if mode == "video":
-                await safe_edit(status, "🎥 Converting to MP4 + Streaming Fix...\n\n⏳ Please wait...")
-                file_path = ensure_mp4_faststart(file_path)
+                await safe_edit(status, "🎥 Fixing Streaming + Seek/Resume...\n\n⏳ Please wait...")
+
+                # 🔥 Restore old working logic
+                file_path = fix_streaming_seek(file_path)
+
+                dur, w, h = ffprobe_video_info(file_path)
                 name_clean = clean_display_name(os.path.basename(file_path))
 
                 await safe_edit(status, "🖼 Generating Thumbnail (Middle Frame)...\n\n⏳ Please wait...")
@@ -414,7 +437,6 @@ async def url_callback_router(
 
             # ✅ Upload
             up_start = time.time()
-
             if mode == "video":
                 await safe_edit(status, "📤 Upload Starting (Video MP4)...")
                 await client.send_video(
@@ -423,6 +445,9 @@ async def url_callback_router(
                     thumb=thumb_path if thumb_path else None,
                     caption=f"✅ Uploaded 🎥\n\n📌 `{name_clean}`\n📦 {naturalsize(size)}",
                     supports_streaming=True,
+                    duration=dur if dur else None,
+                    width=w if w else None,
+                    height=h if h else None,
                     progress=upload_progress,
                     progress_args=(status, uid, up_start, USER_CANCEL),
                 )
