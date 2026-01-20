@@ -17,10 +17,10 @@ from insta import is_instagram_url, clean_insta_url, insta_entry
 # ===========================
 # GLOBALS
 # ===========================
-USER_TASKS = {}
-USER_CANCEL = set()
-USER_STATE = {}
-UI_STATUS_MSG = {}
+USER_TASKS = {}         # uid -> asyncio task
+USER_CANCEL = set()     # uid set
+USER_STATE = {}         # uid -> mode
+UI_STATUS_MSG = {}      # uid -> status message
 LAST_WARN = {}
 LAST_MENU_EDIT = {}
 
@@ -66,8 +66,7 @@ async def safe_answer(cb, text="✅"):
 # HELPERS
 # ===========================
 async def get_or_create_status(message, uid):
-    if uid in UI_STATUS_MSG:
-        return UI_STATUS_MSG[uid]
+    # ✅ Always create new message to avoid edit conflict
     status = await safe_send(message, "⏳ Processing...")
     UI_STATUS_MSG[uid] = status
     return status
@@ -230,7 +229,6 @@ async def text_handler(client, message):
             return await insta_entry(client, message, clean_insta_url(text), USER_TASKS, main_menu_keyboard)
         return await safe_send(message, "❌ Instagram Reel link ayakku ✅", reply_markup=back_keyboard())
 
-    # anti spam
     now = time.time()
     if now - LAST_WARN.get(uid, 0) > 15:
         LAST_WARN[uid] = now
