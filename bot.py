@@ -17,9 +17,9 @@ from insta import is_instagram_url, clean_insta_url, insta_entry
 # ===========================
 # GLOBALS
 # ===========================
-USER_TASKS = {}         # uid -> asyncio task
-USER_CANCEL = set()     # uid set
-USER_STATE = {}         # uid -> mode
+USER_TASKS = {}
+USER_CANCEL = set()
+USER_STATE = {}
 UI_STATUS_MSG = {}      # uid -> status message
 LAST_WARN = {}
 LAST_MENU_EDIT = {}
@@ -67,10 +67,18 @@ async def safe_answer(cb, text="✅"):
 # ===========================
 async def get_or_create_status(message, uid):
     """
-    ✅ Reuse one status msg per user (FloodWait avoid)
+    ✅ Fix UI confusion:
+    - each new task gets fresh status msg
+    - old status cleared
+    - reduces mixed progress text
     """
-    if uid in UI_STATUS_MSG:
-        return UI_STATUS_MSG[uid]
+    old = UI_STATUS_MSG.get(uid)
+    if old:
+        try:
+            await safe_edit(old, "✅ Previous status cleared ✅", reply_markup=None)
+        except:
+            pass
+
     status = await safe_send(message, "⏳ Processing...")
     UI_STATUS_MSG[uid] = status
     return status
@@ -96,11 +104,6 @@ WELCOME_TEXT = (
     "⚠️ Limit: **2GB**\n\n"
     "📸 **Instagram Reel Downloader**\n"
     "➜ Send Reel link ✅\n\n"
-    "📌 How to use?\n"
-    "1️⃣ Select Menu\n"
-    "2️⃣ Send URL / Insta link\n"
-    "3️⃣ Wait processing ⏳\n"
-    "4️⃣ Get output 🎉\n\n"
     "🚀 Now send something to start 👇😊"
 )
 
@@ -134,9 +137,6 @@ async def back_main(client, cb):
     await safe_edit(cb.message, WELCOME_TEXT, reply_markup=main_menu_keyboard())
 
 
-# ===========================
-# MENU EDIT GUARD ✅
-# ===========================
 async def guarded_menu_edit(cb, uid, text):
     if LAST_MENU_EDIT.get(uid) == text:
         return
@@ -203,7 +203,7 @@ async def all_callbacks(client, cb):
 
 
 # ===========================
-# TEXT HANDLER (Auto Detect)
+# TEXT HANDLER
 # ===========================
 @app.on_message(filters.private & filters.text)
 async def text_handler(client, message):
@@ -213,11 +213,9 @@ async def text_handler(client, message):
     if text.startswith("/"):
         return
 
-    # ✅ Insta auto detect
     if is_instagram_url(text):
         return await insta_entry(client, message, clean_insta_url(text), USER_TASKS, main_menu_keyboard)
 
-    # ✅ URL auto detect
     if is_url(text):
         USER_STATE[uid] = "WAIT_URL"
         return await url_flow(client, message, text)
@@ -238,9 +236,6 @@ async def text_handler(client, message):
         return await safe_send(message, "❌ Menu select cheyyu ✅", reply_markup=main_menu_keyboard())
 
 
-# ===========================
-# RUN
-# ===========================
 if __name__ == "__main__":
     if not BOT_TOKEN or not API_ID or not API_HASH:
         print("❌ Please set BOT_TOKEN, API_ID, API_HASH in env!")
